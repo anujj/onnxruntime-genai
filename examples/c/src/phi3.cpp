@@ -40,7 +40,7 @@ void CXX_API(const char* model_path, const char* execution_provider) {
   std::thread th(std::bind(&TerminateSession::Generator_SetTerminate_Call, &catch_terminate, generator.get()));
 
   // Define System Prompt
-  const std::string system_prompt = std::string("<|system|>\n") + "You are a helpful AI and give elaborative answers" + "<|end|>";
+  const std::string system_prompt = std::string("<|system|>\n") + "You are a helpful AI and give very small answers" + "<|end|>";
   bool include_system_prompt = true;
 
   while (true) {
@@ -55,7 +55,8 @@ void CXX_API(const char* model_path, const char* execution_provider) {
       break;  // Exit the loop
     }
 
-    const std::string prompt = tokenizer->ApplyChatTemplate("", text.c_str(), "", true);
+    // Using direct prompt instead of ApplyChatTemplate to avoid library version issues
+    const std::string prompt = "<|user|>\n" + text + "<|end|>\n<|assistant|>\n";
 
     bool is_first_token = true;
     Timing timing;
