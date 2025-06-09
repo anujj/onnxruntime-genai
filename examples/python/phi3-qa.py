@@ -1,7 +1,6 @@
 import onnxruntime_genai as og
 import argparse
 import time
-import json
 
 def main(args):
     if args.verbose: print("Loading model...")
@@ -10,11 +9,10 @@ def main(args):
         first_token_timestamp = 0
 
     config = og.Config(args.model_path)
-    if args.execution_provider != "follow_config":
-        config.clear_providers()
-        if args.execution_provider != "cpu":
-            if args.verbose: print(f"Setting model to {args.execution_provider}")
-            config.append_provider(args.execution_provider)
+    config.clear_providers()
+    if args.execution_provider != "cpu":
+        if args.verbose: print(f"Setting model to {args.execution_provider}")
+        config.append_provider(args.execution_provider)
     model = og.Model(config)
 
     if args.verbose: print("Model loaded")
@@ -30,6 +28,8 @@ def main(args):
     if 'max_length' not in search_options:
         search_options['max_length'] = 2048
 
+    chat_template = '<|user|>\n{input} <|end|>\n<|assistant|>'
+
     # Keep asking for input prompts in a loop
     while True:
         text = input("Input: ")
@@ -40,10 +40,9 @@ def main(args):
         if args.timings: started_timestamp = time.time()
 
         # If there is a chat template, use it
-        input_message = [{"role": "user", "content": text }]
-        input_prompt = tokenizer.apply_chat_template(json.dumps(input_message), add_generation_prompt=True)
+        prompt = f'{chat_template.format(input=text)}'
 
-        input_tokens = tokenizer.encode(input_prompt)
+        input_tokens = tokenizer.encode(prompt)
 
         params = og.GeneratorParams(model)
         params.set_search_options(**search_options)
@@ -85,7 +84,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(argument_default=argparse.SUPPRESS, description="End-to-end AI Question/Answer example for gen-ai")
     parser.add_argument('-m', '--model_path', type=str, required=True, help='Onnx model folder path (must contain genai_config.json and model.onnx)')
-    parser.add_argument('-e', '--execution_provider', type=str, required=False, default='follow_config', choices=["cpu", "cuda", "dml", "follow_config"], help="Execution provider to run the ONNX Runtime session with. Defaults to follow_config that uses the execution provider listed in the genai_config.json instead.")
+    parser.add_argument('-e', '--execution_provider', type=str, required=True, choices=["cpu", "cuda", "dml", "NvTensorRtRtx"], help="Execution provider to run ONNX model with")
     parser.add_argument('-i', '--min_length', type=int, help='Min number of tokens to generate including the prompt')
     parser.add_argument('-l', '--max_length', type=int, help='Max number of tokens to generate including the prompt')
     parser.add_argument('-ds', '--do_sample', action='store_true', default=False, help='Do random sampling. When false, greedy or beam search are used to generate the output. Defaults to false')
