@@ -6,6 +6,7 @@
 #include "kv_cache.h"
 #include "windowed_kv_cache.h"
 #include "../openvino/interface.h"
+#include <iostream>
 
 namespace Generators {
 
@@ -246,6 +247,13 @@ void DefaultKeyValueCache::Update(DeviceSpan<int32_t> beam_indices, int total_le
   shape_[2] = total_length;
   for (int i = 0; i < layer_count_ * 2; i++) {
     presents_[i] = OrtValue::CreateTensor(Allocator(), shape_, type_);
+    size_t element_size = type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 ? 2 : sizeof(int8_t);
+    size_t elements_per_tensor = shape_[0] * shape_[1] * shape_[2] * shape_[3];
+    size_t memory_per_tensor = elements_per_tensor * element_size;
+    if (i == 0) {
+      std::cout << "  Layer " << i << ": " << memory_per_tensor << " bytes (" 
+                << (memory_per_tensor / 1024.0 / 1024.0) << " MB)" << std::endl;
+    }
     state_.outputs_[output_index_ + i] = presents_[i].get();
   }
 
