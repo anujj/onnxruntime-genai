@@ -40,8 +40,8 @@ void CXX_API(const char* model_path, const char* execution_provider) {
   std::thread th(std::bind(&TerminateSession::Generator_SetTerminate_Call, &catch_terminate, generator.get()));
 
   // Define System Prompt
-  const std::string system_instructions = "You are a helpful AI and give very small answers";
-  bool include_system_prompt = false;
+  const std::string system_prompt = std::string("<|system|>\n") + "You are a helpful AI and give elaborative answers" + "<|end|>";
+  bool include_system_prompt = true;
 
   while (true) {
     signal(SIGINT, signalHandlerWrapper);
@@ -55,10 +55,7 @@ void CXX_API(const char* model_path, const char* execution_provider) {
       break;  // Exit the loop
     }
 
-    // Using direct prompt instead of ApplyChatTemplate to avoid library version issues
-    const std::string prompt = "<start_of_turn>user\n" + 
-      (include_system_prompt ? system_instructions + "\n\n" + text : text) + 
-      "<end_of_turn>\n<start_of_turn>model\n";
+    const std::string prompt = tokenizer->ApplyChatTemplate("", text.c_str(), "", true);
 
     bool is_first_token = true;
     Timing timing;
@@ -66,7 +63,7 @@ void CXX_API(const char* model_path, const char* execution_provider) {
 
     auto sequences = OgaSequences::Create();
     if (include_system_prompt) {
-      std::string combined = system_instructions + "\n\n" + prompt;
+      std::string combined = system_prompt + prompt;
       tokenizer->Encode(combined.c_str(), *sequences);
       include_system_prompt = false;
     } else {

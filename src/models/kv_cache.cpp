@@ -6,7 +6,6 @@
 #include "kv_cache.h"
 #include "windowed_kv_cache.h"
 #include "../openvino/interface.h"
-#include <iostream>
 
 namespace Generators {
 
@@ -176,8 +175,14 @@ DefaultKeyValueCache::DefaultKeyValueCache(State& state)
   }
 
   // Set the size after empty_past_ has been created with 0 for this field
-  if (past_present_share_buffer_)
+  if (state.model_.p_device_->GetType() == DeviceType::NvTensorRtRtx &&
+      model_.config_->model.decoder.sliding_window.has_value() &&
+      model_.config_->model.decoder.sliding_window->window_size > 0) {
+    shape_[2] = std::min(state_.params_->search.max_length,
+                         model_.config_->model.decoder.sliding_window->window_size);
+  } else if (past_present_share_buffer_) {
     shape_[2] = state_.params_->search.max_length;
+  }
 
   try {
     for (int i = 0; i < layer_count_ * 2; ++i) {
@@ -247,13 +252,6 @@ void DefaultKeyValueCache::Update(DeviceSpan<int32_t> beam_indices, int total_le
   shape_[2] = total_length;
   for (int i = 0; i < layer_count_ * 2; i++) {
     presents_[i] = OrtValue::CreateTensor(Allocator(), shape_, type_);
-    size_t element_size = type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 ? 2 : sizeof(int8_t);
-    size_t elements_per_tensor = shape_[0] * shape_[1] * shape_[2] * shape_[3];
-    size_t memory_per_tensor = elements_per_tensor * element_size;
-    if (i == 0) {
-      std::cout << "  Layer " << i << ": " << memory_per_tensor << " bytes (" 
-                << (memory_per_tensor / 1024.0 / 1024.0) << " MB)" << std::endl;
-    }
     state_.outputs_[output_index_ + i] = presents_[i].get();
   }
 
@@ -430,7 +428,8 @@ std::unique_ptr<KeyValueCache> CreateKeyValueCache(State& state) {
     return nullptr;
   }
 
-  if (state.model_.config_->model.decoder.sliding_window &&
+  if (state.model_.p_device_->GetType() != DeviceType::NvTensorRtRtx &&
+      state.model_.config_->model.decoder.sliding_window &&
       state.model_.config_->model.decoder.sliding_window->slide_key_value_cache) {
     return std::make_unique<WindowedKeyValueCache>(state);
   }
