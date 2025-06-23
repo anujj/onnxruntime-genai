@@ -1,113 +1,99 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License.
+import onnxruntime_genai as og
+import argparse
+import time
+import json
 
-#include <iomanip>
-#include <string>
-#include <cstring>
-#include "ort_genai.h"
-#include <thread>
-#include <csignal>
-#include <atomic>
-#include <functional>
-#include "common.h"
+def main(args):
+    if args.verbose: print("Loading model...")
+    if args.timings:
+        started_timestamp = 0
+        first_token_timestamp = 0
 
-// C++ API Example
+    config = og.Config(args.model_path)
+    if args.execution_provider != "follow_config":
+        config.clear_providers()
+        if args.execution_provider != "cpu":
+            if args.verbose: print(f"Setting model to {args.execution_provider}")
+            config.append_provider(args.execution_provider)
+    model = og.Model(config)
 
-static TerminateSession catch_terminate;
+    if args.verbose: print("Model loaded")
+    
+    tokenizer = og.Tokenizer(model)
+    tokenizer_stream = tokenizer.create_stream()
+    if args.verbose: print("Tokenizer created")
+    if args.verbose: print()
+    search_options = {name:getattr(args, name) for name in ['do_sample', 'max_length', 'min_length', 'top_p', 'top_k', 'temperature', 'repetition_penalty'] if name in args}
+    
+    # Set the max length to something sensible by default, unless it is specified by the user,
+    # since otherwise it will be set to the entire context length
+    if 'max_length' not in search_options:
+        search_options['max_length'] = 2048
 
-void signalHandlerWrapper(int signum) {
-  catch_terminate.signalHandler(signum);
-}
+    # Keep asking for input prompts in a loop
+    while True:
+        text = input("Input: ")
+        if not text:
+            print("Error, input cannot be empty")
+            continue
 
-void CXX_API(const char* model_path, const char* execution_provider) {
-  std::cout << "Creating config..." << std::endl;
-  auto config = OgaConfig::Create(model_path);
+        if args.timings: started_timestamp = time.time()
 
-  std::string provider(execution_provider);
-  append_provider(*config, provider);
+        # If there is a chat template, use it
+        input_message = [{"role": "user", "content": text }]
+        input_prompt = tokenizer.apply_chat_template(json.dumps(input_message), add_generation_prompt=True)
 
-  std::cout << "Creating model..." << std::endl;
-  auto model = OgaModel::Create(*config);
+        input_tokens = tokenizer.encode(input_prompt)
 
-  std::cout << "Creating tokenizer..." << std::endl;
-  auto tokenizer = OgaTokenizer::Create(*model);
-  auto tokenizer_stream = OgaTokenizerStream::Create(*tokenizer);
+        params = og.GeneratorParams(model)
+        params.set_search_options(**search_options)
+        generator = og.Generator(model, params)
 
-  while (true) {
-    signal(SIGINT, signalHandlerWrapper);
-    std::string text;
-    std::cout << "Prompt: (Use quit() to exit) Or (To terminate current output generation, press Ctrl+C)" << std::endl;
-    // Clear Any cin error flags because of SIGINT
-    std::cin.clear();
-    std::getline(std::cin, text);
+        generator.append_tokens(input_tokens)
+        if args.verbose: print("Generator created")
 
-    if (text == "quit()") {
-      break;  // Exit the loop
-    }
+        if args.verbose: print("Running generation loop ...")
+        if args.timings:
+            first = True
+            new_tokens = []
 
-    const std::string prompt = tokenizer->ApplyChatTemplate("", text.c_str(), "", true);
+        print()
+        print("Output: ", end='', flush=True)
 
-    bool is_first_token = true;
-    Timing timing;
-    timing.RecordStartTimestamp();
+        try:
+            while not generator.is_done():
+                generator.generate_next_token()
+                if args.timings:
+                    if first:
+                        first_token_timestamp = time.time()
+                        first = False
 
-    auto sequences = OgaSequences::Create();
-    tokenizer->Encode(prompt.c_str(), *sequences);
+                new_token = generator.get_next_tokens()[0]
+                print(tokenizer_stream.decode(new_token), end='', flush=True)
+                if args.timings: new_tokens.append(new_token)
+        except KeyboardInterrupt:
+            print("  --control+c pressed, aborting generation--")
+        print()
+        print()
 
-    std::cout << "Generating response..." << std::endl;
+        if args.timings:
+            prompt_time = first_token_timestamp - started_timestamp
+            run_time = time.time() - first_token_timestamp
+            print(f"Prompt length: {len(input_tokens)}, New tokens: {len(new_tokens)}, Time to first: {(prompt_time):.2f}s, Prompt tokens per second: {len(input_tokens)/prompt_time:.2f} tps, New tokens per second: {len(new_tokens)/run_time:.2f} tps")
 
-    auto params = OgaGeneratorParams::Create(*model);
-    params->SetSearchOption("max_length", 1024);
-    auto generator = OgaGenerator::Create(*model, *params);
-    std::thread th(std::bind(&TerminateSession::Generator_SetTerminate_Call, &catch_terminate, generator.get()));
-    generator->AppendTokenSequences(*sequences);
 
-    try {
-      while (!generator->IsDone()) {
-        generator->GenerateNextToken();
-
-        if (is_first_token) {
-          timing.RecordFirstTokenTimestamp();
-          is_first_token = false;
-        }
-
-        const auto num_tokens = generator->GetSequenceCount(0);
-        const auto new_token = generator->GetSequenceData(0)[num_tokens - 1];
-        std::cout << tokenizer_stream->Decode(new_token) << std::flush;
-      }
-    } catch (const std::exception& e) {
-      std::cout << "Session Terminated: " << e.what() << std::endl;
-    }
-
-    timing.RecordEndTimestamp();
-    const int prompt_tokens_length = sequences->SequenceCount(0);
-    const int new_tokens_length = generator->GetSequenceCount(0) - prompt_tokens_length;
-    timing.Log(prompt_tokens_length, new_tokens_length);
-
-    if (th.joinable()) {
-      th.join();  // Join the thread if it's still running
-    }
-
-    for (int i = 0; i < 3; ++i)
-      std::cout << std::endl;
-  }
-}
-
-int main(int argc, char** argv) {
-  std::string model_path, ep;
-  if (!parse_args(argc, argv, model_path, ep)) {
-    return -1;
-  }
-
-  // Responsible for cleaning up the library during shutdown
-  OgaHandle handle;
-
-  std::cout << "-------------" << std::endl;
-  std::cout << "Hello, Phi-3!" << std::endl;
-  std::cout << "-------------" << std::endl;
-
-  std::cout << "C++ API" << std::endl;
-  CXX_API(model_path.c_str(), ep.c_str());
-
-  return 0;
-}
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(argument_default=argparse.SUPPRESS, description="End-to-end AI Question/Answer example for gen-ai")
+    parser.add_argument('-m', '--model_path', type=str, required=True, help='Onnx model folder path (must contain genai_config.json and model.onnx)')
+    parser.add_argument('-e', '--execution_provider', type=str, required=False, default='follow_config', choices=["cpu", "cuda", "dml", "follow_config"], help="Execution provider to run the ONNX Runtime session with. Defaults to follow_config that uses the execution provider listed in the genai_config.json instead.")
+    parser.add_argument('-i', '--min_length', type=int, help='Min number of tokens to generate including the prompt')
+    parser.add_argument('-l', '--max_length', type=int, help='Max number of tokens to generate including the prompt')
+    parser.add_argument('-ds', '--do_sample', action='store_true', default=False, help='Do random sampling. When false, greedy or beam search are used to generate the output. Defaults to false')
+    parser.add_argument('-p', '--top_p', type=float, help='Top p probability to sample with')
+    parser.add_argument('-k', '--top_k', type=int, help='Top k tokens to sample from')
+    parser.add_argument('-t', '--temperature', type=float, help='Temperature to sample with')
+    parser.add_argument('-r', '--repetition_penalty', type=float, help='Repetition penalty to sample with')
+    parser.add_argument('-v', '--verbose', action='store_true', default=False, help='Print verbose output and timing information. Defaults to false')
+    parser.add_argument('-g', '--timings', action='store_true', default=False, help='Print timing information for each generation step. Defaults to false')
+    args = parser.parse_args()
+    main(args)
