@@ -234,6 +234,16 @@ void DefaultPositionInputs::InitializeStaticMask(OrtValue& cpu_attention_mask) {
   // Create static tensor of size max_length and expanded by num_beams
   attention_mask_shape_[0] *= state_.params_->search.num_beams;
   attention_mask_shape_[1] = state_.params_->search.max_length;
+
+  // Clamp attention mask size to sliding window for NvTensorRtRtx EP
+  if (state_.model_.p_device_->GetType() == DeviceType::NvTensorRtRtx &&
+      state_.model_.config_->model.decoder.sliding_window.has_value() &&
+      state_.model_.config_->model.decoder.sliding_window->window_size > 0) {
+    attention_mask_shape_[1] = std::min(attention_mask_shape_[1],
+                                        static_cast<int64_t>(state_.model_.config_->model.decoder.sliding_window->window_size));
+    std::cout << "InitializeStaticMask: Clamped attention_mask to sliding window size: " << attention_mask_shape_[1] << std::endl;
+  }
+
   attention_mask_->CreateTensor(attention_mask_shape_, true);
   auto output_span = attention_mask_->GetDeviceSpan<T>();
   output_span.Zero();
