@@ -85,6 +85,38 @@ WhisperDecoderState::WhisperDecoderState(const WhisperModel& model, const Genera
     ByteWrapTensor(*model_.p_device_inputs_, *cache_indirection_).Zero();
   }
 
+  // Add seqlens_k for GQA in-place KV cache support
+  // seqlens_k contains the past sequence length for each batch item
+  if (HasSeqlensKInput()) {
+    auto seqlens_k_type = model_.session_info_.GetInputDataType(model_.config_->model.decoder.inputs.seqlens_k);
+    auto seqlens_k_shape = std::array<int64_t, 1>{params_->BatchBeamSize()};
+    seqlens_k_ = OrtValue::CreateTensor(GetDeviceInterface(DeviceType::CPU)->GetAllocator(), seqlens_k_shape, seqlens_k_type);
+    
+    // Initialize all batch items to 0 (no past sequence yet)
+    auto data = seqlens_k_->GetTensorMutableData<int32_t>();
+    for (int64_t i = 0; i < params_->BatchBeamSize(); ++i) {
+      data[i] = 0;
+    }
+
+    input_names_.push_back(model_.config_->model.decoder.inputs.seqlens_k.c_str());
+    inputs_.push_back(seqlens_k_.get());
+  }
+
+  // Add total_sequence_length for GQA in-place KV cache support
+  // total_sequence_length is the total sequence length including current token
+  if (HasTotalSeqLengthInput()) {
+    auto total_seq_len_type = model_.session_info_.GetInputDataType(model_.config_->model.decoder.inputs.total_sequence_length);
+    auto total_seq_len_shape = std::array<int64_t, 1>{1};
+    total_seq_length_ = OrtValue::CreateTensor(GetDeviceInterface(DeviceType::CPU)->GetAllocator(), total_seq_len_shape, total_seq_len_type);
+    
+    // Initialize to 0
+    auto data = total_seq_length_->GetTensorMutableData<int32_t>();
+    *data = 0;
+
+    input_names_.push_back(model_.config_->model.decoder.inputs.total_sequence_length.c_str());
+    inputs_.push_back(total_seq_length_.get());
+  }
+
   output_cross_qk_name_ = ComposeKeyValueName(model_.config_->model.decoder.outputs.output_cross_qk_names, 0);
 }
 
@@ -121,7 +153,16 @@ void WhisperDecoderState::UpdateInputsOutputs(DeviceSpan<int32_t>& next_tokens, 
   kv_cache_->Update(beam_indices, current_length);
   logits_.Update(next_tokens, first_run_ ? current_length : new_length);
 
+  // Update total_sequence_length for GQA in-place KV cache support
+  // total_sequence_length = current_length (total sequence length including current token)
+  // This must be set even on first run, as it's used for output shape calculation
+  if (total_seq_length_) {
+    auto data = total_seq_length_->GetTensorMutableData<int32_t>();
+    *data = current_length;
+  }
+
   // Return early if this method is just initializing the above OrtValue objects and not updating them
+  // Note: total_seq_length_ is updated above because it's needed on first run too
   if (first_run_) {
     return;
   }
@@ -129,6 +170,17 @@ void WhisperDecoderState::UpdateInputsOutputs(DeviceSpan<int32_t>& next_tokens, 
   if (past_sequence_length_) {
     auto data = past_sequence_length_->GetTensorMutableData<int32_t>();
     *data = current_length - 1;
+  }
+
+  // Update seqlens_k for GQA in-place KV cache support
+  // seqlens_k = current_length - 1 (past sequence length, i.e., cache has tokens 0..current_length-2)
+  // On first run, seqlens_k stays at 0 (initial value) because there's no past cache yet
+  if (seqlens_k_) {
+    auto data = seqlens_k_->GetTensorMutableData<int32_t>();
+    int32_t past_seq_len = current_length - 1;
+    for (int64_t i = 0; i < params_->BatchBeamSize(); ++i) {
+      data[i] = past_seq_len;
+    }
   }
 
   if (cache_indirection_ && params_->search.num_beams > 1 && !first_update) {

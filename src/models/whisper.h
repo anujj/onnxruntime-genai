@@ -55,6 +55,10 @@ struct WhisperDecoderState : State {
   bool HasCacheIndirectionInput() { return model_.session_info_.HasInput(model_.config_->model.decoder.inputs.cache_indirection); }
   bool UsesDecoderMaskedMHA() { return HasPastSequenceLengthInput() && HasCacheIndirectionInput(); }
 
+  // GQA in-place KV cache support
+  bool HasSeqlensKInput() { return model_.session_info_.HasInput(model_.config_->model.decoder.inputs.seqlens_k); }
+  bool HasTotalSeqLengthInput() { return model_.session_info_.HasInput(model_.config_->model.decoder.inputs.total_sequence_length); }
+
  private:
   // clang-format off
   friend struct WhisperState;
@@ -69,6 +73,10 @@ struct WhisperDecoderState : State {
   // Inputs for beam search attention
   std::unique_ptr<OrtValue> past_sequence_length_;          // Model input
   std::unique_ptr<OrtValue> cache_indirection_;             // Model input { batch_size, num_beams, max_sequence_length }
+
+  // Inputs for GQA in-place KV cache support
+  std::unique_ptr<OrtValue> seqlens_k_;                     // Model input { batch_size } - past sequence lengths per batch item
+  std::unique_ptr<OrtValue> total_seq_length_;              // Model input { 1 } - total sequence length
 
   Logits logits_{*this};                                    // Model output
   std::vector<std::unique_ptr<OrtValue>> output_cross_qk_;  // Model output { batch_size, num_heads, sequence_length, num_frames / 2 }
