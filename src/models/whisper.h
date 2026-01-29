@@ -55,15 +55,26 @@ struct WhisperDecoderState : State {
   bool HasCacheIndirectionInput() { return model_.session_info_.HasInput(model_.config_->model.decoder.inputs.cache_indirection); }
   bool UsesDecoderMaskedMHA() { return HasPastSequenceLengthInput() && HasCacheIndirectionInput(); }
 
-  // GQA in-place KV cache support
-  bool HasSeqlensKInput() { return model_.session_info_.HasInput(model_.config_->model.decoder.inputs.seqlens_k); }
-  bool HasTotalSeqLengthInput() { return model_.session_info_.HasInput(model_.config_->model.decoder.inputs.total_sequence_length); }
+  // GQA in-place KV cache support with attention_mask
+  bool HasAttentionMaskInput() const { return model_.session_info_.HasInput(model_.config_->model.decoder.inputs.attention_mask); }
 
  private:
   // clang-format off
   friend struct WhisperState;
 
   void UpdateInputsOutputs(DeviceSpan<int32_t>& next_tokens, DeviceSpan<int32_t> next_indices, int current_length, bool first_update);
+
+  // Attention mask helper functions
+  template <typename T>
+  void CreateAndInitializeAttentionMask(int64_t valid_length);
+
+  template <typename T>
+  void UpdateAttentionMaskStaticImpl(T* mask_data, int64_t batch_size, int64_t current_length, int64_t max_length);
+
+  template <typename T>
+  void UpdateAttentionMaskDynamicImpl(T* next_mask_data, const T* current_mask_data, int64_t batch_size, int64_t old_seq_length, int64_t new_seq_length);
+
+  void UpdateAttentionMask(int current_length);
 
   const WhisperModel& model_;
 
@@ -74,9 +85,13 @@ struct WhisperDecoderState : State {
   std::unique_ptr<OrtValue> past_sequence_length_;          // Model input
   std::unique_ptr<OrtValue> cache_indirection_;             // Model input { batch_size, num_beams, max_sequence_length }
 
-  // Inputs for GQA in-place KV cache support
-  std::unique_ptr<OrtValue> seqlens_k_;                     // Model input { batch_size } - past sequence lengths per batch item
-  std::unique_ptr<OrtValue> total_seq_length_;              // Model input { 1 } - total sequence length
+  // Attention mask support (TensorRT-RTX pattern) for GQA in-place KV cache
+  std::unique_ptr<OrtValue> attention_mask_;                // Current mask [batch_size, seq_len or max_length]
+  std::unique_ptr<OrtValue> attention_mask_next_;           // Next mask (for updates, only used for dynamic mode)
+  bool has_attention_mask_input_{false};                    // Model has attention_mask input
+  bool use_static_buffer_{false};                           // True if using in-place KV cache (pre-allocated buffer)
+  ONNXTensorElementDataType mask_type_{};                   // INT32 or INT64
+  std::array<int64_t, 2> attention_mask_shape_{0, 0};      // [batch_size, seq_len] or [batch_size, max_length] for static
 
   Logits logits_{*this};                                    // Model output
   std::vector<std::unique_ptr<OrtValue>> output_cross_qk_;  // Model output { batch_size, num_heads, sequence_length, num_frames / 2 }
