@@ -5,6 +5,7 @@
 #include "model.h"
 #include "kv_cache.h"
 #include "windowed_kv_cache.h"
+#include "utils.h"
 #include "../openvino/interface.h"
 #include <algorithm>
 #include <cstdlib>
@@ -278,18 +279,44 @@ void DefaultKeyValueCache::Add() {
     state_.output_names_.push_back(output_name_strings_[i].c_str());
   }
 
-  // For shared_past_present, the past & presents never change, so set the inputs to the present values (outputs are already set above)
-  if (past_present_share_buffer_) {
-    for (int i = 0; i < layer_count_ * 2; ++i) {
-      state_.inputs_[input_index_ + i] = presents_[i].get();
-    }
-  }
+  // For shared past/present buffers, bind inputs in Update() so the input shapes
+  // reflect the true past length (0 on first run, then grows each step).
 }
 
 void DefaultKeyValueCache::Update(DeviceSpan<int32_t> beam_indices, int total_length) {
-  // If we're sharing past & present buffers there is nothing to do here, so early exit
-  if (past_present_share_buffer_)
+  // If we're sharing past & present buffers, keep the same underlying storage but
+  // update the input shapes to reflect the current past length. This avoids
+  // shape-based graph dependencies (e.g., position ids) from using max_length.
+  if (past_present_share_buffer_) {
+    int64_t past_length = 0;
+    if (!is_first_update_) {
+      // During generation (1 token at a time), past length is total_length - 1.
+      past_length = std::max<int64_t>(0, static_cast<int64_t>(total_length) - 1);
+    }
+
+    for (int i = 0; i < layer_count_ * 2; ++i) {
+      const int layer_idx = i / 2;
+      std::array<int64_t, 4> base_shape = shape_;
+      if (!layer_shapes_.empty()) {
+        base_shape = layer_shapes_[layer_idx];
+      }
+
+      std::array<int64_t, 4> view_shape = base_shape;
+      // Clamp past length to allocated capacity (handles sliding window).
+      view_shape[2] = std::min<int64_t>(past_length, base_shape[2]);
+
+      size_t max_bytes = static_cast<size_t>(Ort::SizeOf(type_)) *
+                         static_cast<size_t>(ElementCountFromShape(base_shape));
+      void* data_ptr = presents_[i]->GetTensorMutableRawData();
+      const OrtMemoryInfo& mem_info = presents_[i]->GetTensorMemoryInfo();
+
+      pasts_[i] = OrtValue::CreateTensor(mem_info, data_ptr, max_bytes, view_shape, type_);
+      state_.inputs_[input_index_ + i] = pasts_[i].get();
+    }
+
+    is_first_update_ = false;
     return;
+  }
 
   if (!is_first_update_) {
     for (int i = 0; i < layer_count_ * 2; i++) {
