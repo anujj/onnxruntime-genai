@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <cctype>
+#include <limits>
 
 namespace Generators {
 
@@ -102,13 +103,33 @@ static void WhisperLogAttentionMaskSummary(const char* tag, const T* mask_data,
     return;
   }
   const int64_t tail_len = seq_len < 8 ? seq_len : 8;
+  int64_t global_min = static_cast<int64_t>(mask_data[0]);
+  int64_t global_max = global_min;
   int64_t sum0 = 0;
-  const T* base = mask_data;  // batch 0
-  for (int64_t i = 0; i < seq_len; ++i) {
-    sum0 += static_cast<int64_t>(base[i]);
+  int64_t min_sum = std::numeric_limits<int64_t>::max();
+  int64_t max_sum = std::numeric_limits<int64_t>::min();
+
+  for (int64_t batch = 0; batch < batch_size; ++batch) {
+    const T* base = mask_data + batch * seq_len;
+    int64_t sum = 0;
+    for (int64_t i = 0; i < seq_len; ++i) {
+      int64_t v = static_cast<int64_t>(base[i]);
+      sum += v;
+      if (v < global_min) global_min = v;
+      if (v > global_max) global_max = v;
+    }
+    if (sum < min_sum) min_sum = sum;
+    if (sum > max_sum) max_sum = sum;
+    if (batch == 0) sum0 = sum;
   }
+
   std::cout << "[WHISPER_MASK][" << tag << "] current_length=" << current_length
-            << " seq_len=" << seq_len << " sum_b0=" << sum0 << " tail_b0=[";
+            << " seq_len=" << seq_len << " sum_b0=" << sum0
+            << " sum_min=" << min_sum << " sum_max=" << max_sum
+            << " global_min=" << global_min << " global_max=" << global_max
+            << " expected_past_len=" << (max_sum - current_length)
+            << " tail_b0=[";
+  const T* base = mask_data;  // batch 0
   for (int64_t i = seq_len - tail_len; i < seq_len; ++i) {
     if (i > seq_len - tail_len) std::cout << ",";
     std::cout << static_cast<int64_t>(base[i]);
@@ -305,6 +326,7 @@ void WhisperDecoderState::CreateAndInitializeAttentionMask(int64_t valid_length)
           mask_data[i] = static_cast<T>(1);
         }
       }
+      WhisperLogAttentionMaskSummary("init_cpu", mask_data, batch_size, buffer_length, valid_length);
       WHISPER_DEBUG_LOG("CREATE_MASK", "     CPU initialization complete"); std::cout.flush();
 
       // Create GPU tensor
@@ -343,6 +365,7 @@ void WhisperDecoderState::CreateAndInitializeAttentionMask(int64_t valid_length)
           mask_data[i] = static_cast<T>(1);
         }
       }
+      WhisperLogAttentionMaskSummary("init_cpu", mask_data, batch_size, buffer_length, valid_length);
     }
 
     WHISPER_DEBUG_LOG("CREATE_MASK", "  >> CreateAndInitializeAttentionMask COMPLETE"); std::cout.flush();

@@ -5,44 +5,10 @@
 #include "model.h"
 #include "kv_cache.h"
 #include "windowed_kv_cache.h"
-#include "utils.h"
 #include "../openvino/interface.h"
 #include <algorithm>
-#include <cstdlib>
-#include <iostream>
 
 namespace Generators {
-
-// ============================================================================
-// DEBUG LOGGING (Controlled by WHISPER_DEBUG_LOG environment variable)
-// ============================================================================
-#ifdef _MSC_VER
-#pragma warning(push)
-#pragma warning(disable : 4996)  // Suppress getenv deprecation warning
-#endif
-
-static bool IsWhisperDebugEnabled() {
-  static bool initialized = false;
-  static bool enabled = false;
-  if (!initialized) {
-    const char* env = std::getenv("WHISPER_DEBUG_LOG");
-    enabled = (env != nullptr && (std::string(env) == "1" || std::string(env) == "true"));
-    initialized = true;
-  }
-  return enabled;
-}
-
-#ifdef _MSC_VER
-#pragma warning(pop)
-#endif
-
-#define WHISPER_DEBUG_LOG(tag, msg) \
-  do { \
-    if (IsWhisperDebugEnabled()) { \
-      std::cout << "[WHISPER_DEBUG][" << tag << "] " << msg << std::endl; \
-    } \
-  } while(0)
-// ============================================================================
 
 CombinedKeyValueCache::CombinedKeyValueCache(State& state)
     : state_{state},
@@ -279,44 +245,19 @@ void DefaultKeyValueCache::Add() {
     state_.output_names_.push_back(output_name_strings_[i].c_str());
   }
 
-  // For shared past/present buffers, bind inputs in Update() so the input shapes
-  // reflect the true past length (0 on first run, then grows each step).
+  // For shared_past_present, the past & presents never change, so set the inputs
+  // to the present values (outputs are already set above)
+  if (past_present_share_buffer_) {
+    for (int i = 0; i < layer_count_ * 2; ++i) {
+      state_.inputs_[input_index_ + i] = presents_[i].get();
+    }
+  }
 }
 
 void DefaultKeyValueCache::Update(DeviceSpan<int32_t> beam_indices, int total_length) {
-  // If we're sharing past & present buffers, keep the same underlying storage but
-  // update the input shapes to reflect the current past length. This avoids
-  // shape-based graph dependencies (e.g., position ids) from using max_length.
-  if (past_present_share_buffer_) {
-    int64_t past_length = 0;
-    if (!is_first_update_) {
-      // During generation (1 token at a time), past length is total_length - 1.
-      past_length = std::max<int64_t>(0, static_cast<int64_t>(total_length) - 1);
-    }
-
-    for (int i = 0; i < layer_count_ * 2; ++i) {
-      const int layer_idx = i / 2;
-      std::array<int64_t, 4> base_shape = shape_;
-      if (!layer_shapes_.empty()) {
-        base_shape = layer_shapes_[layer_idx];
-      }
-
-      std::array<int64_t, 4> view_shape = base_shape;
-      // Clamp past length to allocated capacity (handles sliding window).
-      view_shape[2] = std::min<int64_t>(past_length, base_shape[2]);
-
-      size_t max_bytes = static_cast<size_t>(Ort::SizeOf(type_)) *
-                         static_cast<size_t>(ElementCountFromShape(base_shape));
-      void* data_ptr = presents_[i]->GetTensorMutableRawData();
-      const OrtMemoryInfo& mem_info = presents_[i]->GetTensorMemoryInfo();
-
-      pasts_[i] = OrtValue::CreateTensor(mem_info, data_ptr, max_bytes, view_shape, type_);
-      state_.inputs_[input_index_ + i] = pasts_[i].get();
-    }
-
-    is_first_update_ = false;
+  // If we're sharing past & present buffers there is nothing to do here, so early exit
+  if (past_present_share_buffer_)
     return;
-  }
 
   if (!is_first_update_) {
     for (int i = 0; i < layer_count_ * 2; i++) {
@@ -495,65 +436,35 @@ CrossCache::CrossCache(State& state, int sequence_length) {
   shape_ = std::array<int64_t, 4>{state.params_->BatchBeamSize(), model.config_->model.decoder.num_attention_heads, sequence_length, model.config_->model.decoder.head_size};
   values_.reserve(layer_count_ * 2);
 
-  WHISPER_DEBUG_LOG("CROSS_KV_CACHE_INIT", "Creating CrossCache");
-  WHISPER_DEBUG_LOG("CROSS_KV_CACHE_INIT", "Layer count: " << layer_count_);
-  WHISPER_DEBUG_LOG("CROSS_KV_CACHE_INIT", "Buffer shape: [" << shape_[0] << ", " << shape_[1] << ", " << shape_[2] << ", " << shape_[3] << "]");
-  WHISPER_DEBUG_LOG("CROSS_KV_CACHE_INIT", "Encoder sequence length: " << sequence_length);
-
   for (int i = 0; i < layer_count_; ++i) {
     output_name_strings_.emplace_back(ComposeKeyValueName(model.config_->model.encoder.outputs.cross_present_key_names, i));
     output_name_strings_.emplace_back(ComposeKeyValueName(model.config_->model.encoder.outputs.cross_present_value_names, i));
 
     input_name_strings_.emplace_back(ComposeKeyValueName(model.config_->model.decoder.inputs.cross_past_key_names, i));
     input_name_strings_.emplace_back(ComposeKeyValueName(model.config_->model.decoder.inputs.cross_past_value_names, i));
-
-    if (IsWhisperDebugEnabled() && i == 0) {
-      WHISPER_DEBUG_LOG("CROSS_KV_CACHE_INIT", "Sample names (layer 0):");
-      WHISPER_DEBUG_LOG("CROSS_KV_CACHE_INIT", "  Encoder output: " << output_name_strings_[i * 2]);
-      WHISPER_DEBUG_LOG("CROSS_KV_CACHE_INIT", "  Encoder output: " << output_name_strings_[i * 2 + 1]);
-      WHISPER_DEBUG_LOG("CROSS_KV_CACHE_INIT", "  Decoder input:  " << input_name_strings_[i * 2]);
-      WHISPER_DEBUG_LOG("CROSS_KV_CACHE_INIT", "  Decoder input:  " << input_name_strings_[i * 2 + 1]);
-    }
   }
 
   // Derive the cross attention KV cache's data type
   type_ = model.session_info_.GetOutputDataType(output_name_strings_[0]);
 
-  WHISPER_DEBUG_LOG("CROSS_KV_CACHE_INIT", "Buffer data type: " << (type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 ? "FP16" : "FP32"));
-
   for (int i = 0; i < layer_count_; ++i) {
     values_.push_back(OrtValue::CreateTensor(allocator, shape_, type_));
     values_.push_back(OrtValue::CreateTensor(allocator, shape_, type_));
   }
-
-  WHISPER_DEBUG_LOG("CROSS_KV_CACHE_INIT", "Created " << values_.size() << " GPU buffers (K+V for " << layer_count_ << " layers)");
 }
 
 void CrossCache::AddOutputs(State& state) {
-  WHISPER_DEBUG_LOG("CROSS_KV_CACHE_OUTPUTS", "Adding " << (layer_count_ * 2) << " encoder outputs");
   for (int i = 0; i < layer_count_ * 2; ++i) {
     state.outputs_.push_back(values_[i].get());
     state.output_names_.push_back(output_name_strings_[i].c_str());
-
-    if (IsWhisperDebugEnabled() && i < 4) {
-      WHISPER_DEBUG_LOG("CROSS_KV_CACHE_OUTPUTS", "  [" << i << "] " << output_name_strings_[i]
-                        << " -> buffer ptr=" << values_[i].get());
-    }
   }
 }
 
 void CrossCache::AddInputs(State& state) {
-  WHISPER_DEBUG_LOG("CROSS_KV_CACHE_INPUTS", "Adding " << (layer_count_ * 2) << " decoder inputs (same buffers as encoder outputs)");
   for (int i = 0; i < layer_count_ * 2; ++i) {
     state.inputs_.push_back(values_[i].get());
     state.input_names_.push_back(input_name_strings_[i].c_str());
-
-    if (IsWhisperDebugEnabled() && i < 4) {
-      WHISPER_DEBUG_LOG("CROSS_KV_CACHE_INPUTS", "  [" << i << "] " << input_name_strings_[i]
-                        << " -> buffer ptr=" << values_[i].get() << " (SAME BUFFER, zero-copy)");
-    }
   }
-  WHISPER_DEBUG_LOG("CROSS_KV_CACHE_INPUTS", "Zero-copy buffer sharing: Encoder writes -> Decoder reads same GPU memory");
 }
 
 std::string ComposeKeyValueName(const std::string& template_string, int index) {
