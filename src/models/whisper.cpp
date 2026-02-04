@@ -2,203 +2,7 @@
 // Licensed under the MIT License.
 #include "../generators.h"
 #include "whisper.h"
-#include <cstdlib>
-#include <iostream>
-#include <iomanip>
-#include <chrono>
-#include <filesystem>
-#include <fstream>
-#include <cctype>
-#include <limits>
-
 namespace Generators {
-
-// ============================================================================
-// DEBUG LOGGING (Controlled by WHISPER_DEBUG_LOG environment variable)
-// ============================================================================
-#ifdef _MSC_VER
-#pragma warning(push)
-#pragma warning(disable : 4996)  // Suppress getenv deprecation warning
-#endif
-
-static bool IsWhisperDebugEnabled() {
-  static bool initialized = false;
-  static bool enabled = false;
-  if (!initialized) {
-    const char* env = std::getenv("WHISPER_DEBUG_LOG");
-    enabled = (env != nullptr && (std::string(env) == "1" || std::string(env) == "true"));
-    if (enabled) {
-      std::cout << "[WHISPER_DEBUG] Debug logging ENABLED (WHISPER_DEBUG_LOG=" << env << ")" << std::endl;
-    }
-    initialized = true;
-  }
-  return enabled;
-}
-
-#ifdef _MSC_VER
-#pragma warning(pop)
-#endif
-
-#define WHISPER_DEBUG_LOG(tag, msg) \
-  do { \
-    if (IsWhisperDebugEnabled()) { \
-      std::cout << "[WHISPER_DEBUG][" << tag << "] " << msg << std::endl; \
-    } \
-  } while(0)
-
-#ifdef _MSC_VER
-#pragma warning(push)
-#pragma warning(disable : 4996)  // Suppress getenv deprecation warning
-#endif
-
-static bool IsWhisperDumpInputsEnabled() {
-  static bool initialized = false;
-  static bool enabled = false;
-  if (!initialized) {
-    const char* env = std::getenv("WHISPER_DUMP_INPUTS");
-    enabled = (env != nullptr && (std::string(env) == "1" || std::string(env) == "true"));
-    initialized = true;
-  }
-  return enabled;
-}
-
-static bool IsWhisperMaskLogEnabled() {
-  static bool initialized = false;
-  static bool enabled = false;
-  if (!initialized) {
-    const char* env = std::getenv("WHISPER_LOG_ATTENTION_MASK");
-    enabled = (env != nullptr && (std::string(env) == "1" || std::string(env) == "true"));
-    initialized = true;
-  }
-  return enabled;
-}
-
-static std::string WhisperDumpDir() {
-  static std::string dir = []() -> std::string {
-    const char* env = std::getenv("WHISPER_DUMP_DIR");
-    if (env && *env) {
-      return std::string(env);
-    }
-    return "D:\\code\\gitlab\\trt-rtx-plugins\\decoder_debug\\whisper_inputs";
-  }();
-  return dir;
-}
-
-#ifdef _MSC_VER
-#pragma warning(pop)
-#endif
-
-#define WHISPER_DUMP_LOG(tag, msg) \
-  do { \
-    if (IsWhisperDumpInputsEnabled()) { \
-      std::cout << "[WHISPER_DUMP][" << tag << "] " << msg << std::endl; \
-    } \
-  } while(0)
-
-template <typename T>
-static void WhisperLogAttentionMaskSummary(const char* tag, const T* mask_data,
-                                           int64_t batch_size, int64_t seq_len,
-                                           int64_t current_length) {
-  if (!IsWhisperMaskLogEnabled() || mask_data == nullptr || batch_size <= 0 || seq_len <= 0) {
-    return;
-  }
-  const int64_t tail_len = seq_len < 8 ? seq_len : 8;
-  int64_t global_min = static_cast<int64_t>(mask_data[0]);
-  int64_t global_max = global_min;
-  int64_t sum0 = 0;
-  int64_t min_sum = std::numeric_limits<int64_t>::max();
-  int64_t max_sum = std::numeric_limits<int64_t>::min();
-
-  for (int64_t batch = 0; batch < batch_size; ++batch) {
-    const T* base = mask_data + batch * seq_len;
-    int64_t sum = 0;
-    for (int64_t i = 0; i < seq_len; ++i) {
-      int64_t v = static_cast<int64_t>(base[i]);
-      sum += v;
-      if (v < global_min) global_min = v;
-      if (v > global_max) global_max = v;
-    }
-    if (sum < min_sum) min_sum = sum;
-    if (sum > max_sum) max_sum = sum;
-    if (batch == 0) sum0 = sum;
-  }
-
-  std::cout << "[WHISPER_MASK][" << tag << "] current_length=" << current_length
-            << " seq_len=" << seq_len << " sum_b0=" << sum0
-            << " sum_min=" << min_sum << " sum_max=" << max_sum
-            << " global_min=" << global_min << " global_max=" << global_max
-            << " expected_past_len=" << (max_sum - current_length)
-            << " tail_b0=[";
-  const T* base = mask_data;  // batch 0
-  for (int64_t i = seq_len - tail_len; i < seq_len; ++i) {
-    if (i > seq_len - tail_len) std::cout << ",";
-    std::cout << static_cast<int64_t>(base[i]);
-  }
-  std::cout << "]" << std::endl;
-}
-
-static std::string SanitizeName(const std::string& name) {
-  std::string out = name;
-  for (auto& c : out) {
-    if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '-') {
-      c = '_';
-    }
-  }
-  return out;
-}
-
-static void DumpOrtValueToFile(const std::string& dir, const std::string& name, OrtValue* tensor, DeviceInterface& device, bool is_gpu) {
-  if (!tensor) {
-    WHISPER_DUMP_LOG("INPUTS", "Skip null tensor: " << name);
-    return;
-  }
-
-  auto info = tensor->GetTensorTypeAndShapeInfo();
-  auto elem_type = info->GetElementType();
-  auto shape = info->GetShape();
-  auto element_count = info->GetElementCount();
-  size_t bytes = static_cast<size_t>(element_count) * Ort::SizeOf(elem_type);
-
-  std::unique_ptr<OrtValue> cpu_tensor;
-  OrtValue* tensor_to_dump = tensor;
-
-  if (is_gpu) {
-    auto& cpu_allocator = GetDeviceInterface(DeviceType::CPU)->GetAllocator();
-    cpu_tensor = OrtValue::CreateTensor(cpu_allocator, shape, elem_type);
-    auto cpu_span = ByteWrapTensor(*GetDeviceInterface(DeviceType::CPU), *cpu_tensor);
-    auto gpu_span = ByteWrapTensor(device, *tensor);
-    cpu_span.CopyFrom(gpu_span);
-    tensor_to_dump = cpu_tensor.get();
-  }
-
-  std::filesystem::create_directories(dir);
-  std::string filename = SanitizeName(name) + ".bin";
-  std::string path = (std::filesystem::path(dir) / filename).string();
-
-  std::ofstream out(path, std::ios::binary);
-  if (!out) {
-    WHISPER_DUMP_LOG("INPUTS", "Failed to open file: " << path);
-    return;
-  }
-  out.write(reinterpret_cast<const char*>(tensor_to_dump->GetTensorData<uint8_t>()), static_cast<std::streamsize>(bytes));
-  out.close();
-
-  WHISPER_DUMP_LOG("INPUTS", "Dumped " << name << " bytes=" << bytes << " -> " << path);
-}
-
-static void LogTensorShape(const char* name, const OrtValue* tensor) {
-  if (!IsWhisperDebugEnabled() || !tensor) return;
-  auto shape_info = tensor->GetTensorTypeAndShapeInfo();
-  auto shape = shape_info->GetShape();
-  std::cout << "  " << name << ": shape [";
-  for (size_t i = 0; i < shape.size(); ++i) {
-    std::cout << shape[i];
-    if (i < shape.size() - 1) std::cout << ", ";
-  }
-  std::cout << "]";
-}
-// ============================================================================
-
 WhisperModel::WhisperModel(std::unique_ptr<Config> config, OrtEnv& ort_env)
     : Model{std::move(config)} {
   encoder_session_options_ = OrtSessionOptions::Create();
@@ -279,8 +83,9 @@ WhisperDecoderState::WhisperDecoderState(const WhisperModel& model, const Genera
     ByteWrapTensor(*model_.p_device_inputs_, *cache_indirection_).Zero();
   }
 
-  // Check if model has attention_mask input (for GQA in-place KV cache)
-  has_attention_mask_input_ = HasAttentionMaskInput();
+  // attention_mask is only supported for NvTensorRtRtx EP
+  const bool is_trt_rtx = model_.p_device_inputs_->GetType() == DeviceType::NvTensorRtRtx;
+  has_attention_mask_input_ = is_trt_rtx && HasAttentionMaskInput();
   // Note: attention_mask will be initialized lazily on first run when current_length is known
 
   output_cross_qk_name_ = ComposeKeyValueName(model_.config_->model.decoder.outputs.output_cross_qk_names, 0);
@@ -288,93 +93,63 @@ WhisperDecoderState::WhisperDecoderState(const WhisperModel& model, const Genera
 
 template <typename T>
 void WhisperDecoderState::CreateAndInitializeAttentionMask(int64_t valid_length) {
-  WHISPER_DEBUG_LOG("CREATE_MASK", "  >> CreateAndInitializeAttentionMask ENTRY"); std::cout.flush();
-  WHISPER_DEBUG_LOG("CREATE_MASK", "     valid_length=" << valid_length); std::cout.flush();
+  int64_t batch_size = attention_mask_shape_[0];
+  int64_t buffer_length = attention_mask_shape_[1];  // max_length for static, current length for dynamic
 
-  try {
-    int64_t batch_size = attention_mask_shape_[0];
-    int64_t buffer_length = attention_mask_shape_[1];  // max_length for static, current length for dynamic
-    WHISPER_DEBUG_LOG("CREATE_MASK", "     batch_size=" << batch_size << " buffer_length=" << buffer_length); std::cout.flush();
+  // Check if we're on GPU - if so, we need to create on CPU first, then copy
+  bool is_gpu = (model_.p_device_inputs_->GetType() != DeviceType::CPU);
 
-    // Check if we're on GPU - if so, we need to create on CPU first, then copy
-    bool is_gpu = (model_.p_device_inputs_->GetType() != DeviceType::CPU);
-    WHISPER_DEBUG_LOG("CREATE_MASK", "     is_gpu=" << is_gpu << " device_type=" << static_cast<int>(model_.p_device_inputs_->GetType())); std::cout.flush();
+  if (is_gpu) {
+    // GPU path: Create on CPU, initialize, then copy to GPU
+    auto& cpu_allocator = GetDeviceInterface(DeviceType::CPU)->GetAllocator();
+    auto cpu_tensor = OrtValue::CreateTensor(cpu_allocator, attention_mask_shape_, mask_type_);
 
-    if (is_gpu) {
-      // GPU path: Create on CPU, initialize, then copy to GPU
-      WHISPER_DEBUG_LOG("CREATE_MASK", "     Creating CPU tensor for initialization..."); std::cout.flush();
-      auto& cpu_allocator = GetDeviceInterface(DeviceType::CPU)->GetAllocator();
-      auto cpu_tensor = OrtValue::CreateTensor(cpu_allocator, attention_mask_shape_, mask_type_);
-      WHISPER_DEBUG_LOG("CREATE_MASK", "     CPU tensor created"); std::cout.flush();
+    auto* mask_data = cpu_tensor->GetTensorMutableData<T>();
 
-      auto* mask_data = cpu_tensor->GetTensorMutableData<T>();
-      WHISPER_DEBUG_LOG("CREATE_MASK", "     CPU mask_data ptr=" << (void*)mask_data); std::cout.flush();
-
-      // Initialize mask values on CPU
-      WHISPER_DEBUG_LOG("CREATE_MASK", "     Initializing mask values on CPU (use_static_buffer_=" << use_static_buffer_ << ")..."); std::cout.flush();
-      if (use_static_buffer_) {
-        // For static buffer: valid tokens followed by padding
-        for (int64_t batch = 0; batch < batch_size; ++batch) {
-          for (int64_t i = 0; i < buffer_length; ++i) {
-            mask_data[batch * buffer_length + i] = (i < valid_length) ? static_cast<T>(1) : static_cast<T>(0);
-          }
-        }
-      } else {
-        // For dynamic mode: all tokens are valid (no pre-allocated padding)
-        int64_t total_elements = batch_size * buffer_length;
-        for (int64_t i = 0; i < total_elements; ++i) {
-          mask_data[i] = static_cast<T>(1);
+    // Initialize mask values on CPU
+    if (use_static_buffer_) {
+      // For static buffer: valid tokens followed by padding
+      for (int64_t batch = 0; batch < batch_size; ++batch) {
+        for (int64_t i = 0; i < buffer_length; ++i) {
+          mask_data[batch * buffer_length + i] = (i < valid_length) ? static_cast<T>(1) : static_cast<T>(0);
         }
       }
-      WhisperLogAttentionMaskSummary("init_cpu", mask_data, batch_size, buffer_length, valid_length);
-      WHISPER_DEBUG_LOG("CREATE_MASK", "     CPU initialization complete"); std::cout.flush();
-
-      // Create GPU tensor
-      WHISPER_DEBUG_LOG("CREATE_MASK", "     Creating GPU tensor..."); std::cout.flush();
-      auto& gpu_allocator = model_.p_device_inputs_->GetAllocator();
-      attention_mask_ = OrtValue::CreateTensor(gpu_allocator, attention_mask_shape_, mask_type_);
-      WHISPER_DEBUG_LOG("CREATE_MASK", "     GPU tensor created"); std::cout.flush();
-
-      // Copy CPU to GPU
-      WHISPER_DEBUG_LOG("CREATE_MASK", "     Copying CPU to GPU..."); std::cout.flush();
-      auto cpu_span = ByteWrapTensor(*GetDeviceInterface(DeviceType::CPU), *cpu_tensor);
-      auto gpu_span = ByteWrapTensor(*model_.p_device_inputs_, *attention_mask_);
-      gpu_span.CopyFrom(cpu_span);
-      WHISPER_DEBUG_LOG("CREATE_MASK", "     Copy complete"); std::cout.flush();
     } else {
-      // CPU path: Create and initialize directly
-      WHISPER_DEBUG_LOG("CREATE_MASK", "     Creating CPU tensor directly..."); std::cout.flush();
-      auto& allocator = model_.p_device_inputs_->GetAllocator();
-      attention_mask_ = OrtValue::CreateTensor(allocator, attention_mask_shape_, mask_type_);
-      WHISPER_DEBUG_LOG("CREATE_MASK", "     CPU tensor created"); std::cout.flush();
-
-      auto* mask_data = attention_mask_->GetTensorMutableData<T>();
-      WHISPER_DEBUG_LOG("CREATE_MASK", "     mask_data ptr=" << (void*)mask_data); std::cout.flush();
-
-      // Initialize mask values
-      WHISPER_DEBUG_LOG("CREATE_MASK", "     Initializing mask values (use_static_buffer_=" << use_static_buffer_ << ")..."); std::cout.flush();
-      if (use_static_buffer_) {
-        for (int64_t batch = 0; batch < batch_size; ++batch) {
-          for (int64_t i = 0; i < buffer_length; ++i) {
-            mask_data[batch * buffer_length + i] = (i < valid_length) ? static_cast<T>(1) : static_cast<T>(0);
-          }
-        }
-      } else {
-        int64_t total_elements = batch_size * buffer_length;
-        for (int64_t i = 0; i < total_elements; ++i) {
-          mask_data[i] = static_cast<T>(1);
-        }
+      // For dynamic mode: all tokens are valid (no pre-allocated padding)
+      int64_t total_elements = batch_size * buffer_length;
+      for (int64_t i = 0; i < total_elements; ++i) {
+        mask_data[i] = static_cast<T>(1);
       }
-      WhisperLogAttentionMaskSummary("init_cpu", mask_data, batch_size, buffer_length, valid_length);
     }
 
-    WHISPER_DEBUG_LOG("CREATE_MASK", "  >> CreateAndInitializeAttentionMask COMPLETE"); std::cout.flush();
-  } catch (const std::exception& e) {
-    WHISPER_DEBUG_LOG("CREATE_MASK", "  >> ERROR in CreateAndInitializeAttentionMask: " << e.what()); std::cout.flush();
-    throw;
-  } catch (...) {
-    WHISPER_DEBUG_LOG("CREATE_MASK", "  >> ERROR: Unknown exception in CreateAndInitializeAttentionMask"); std::cout.flush();
-    throw;
+    // Create GPU tensor
+    auto& gpu_allocator = model_.p_device_inputs_->GetAllocator();
+    attention_mask_ = OrtValue::CreateTensor(gpu_allocator, attention_mask_shape_, mask_type_);
+
+    // Copy CPU to GPU
+    auto cpu_span = ByteWrapTensor(*GetDeviceInterface(DeviceType::CPU), *cpu_tensor);
+    auto gpu_span = ByteWrapTensor(*model_.p_device_inputs_, *attention_mask_);
+    gpu_span.CopyFrom(cpu_span);
+  } else {
+    // CPU path: Create and initialize directly
+    auto& allocator = model_.p_device_inputs_->GetAllocator();
+    attention_mask_ = OrtValue::CreateTensor(allocator, attention_mask_shape_, mask_type_);
+
+    auto* mask_data = attention_mask_->GetTensorMutableData<T>();
+
+    // Initialize mask values
+    if (use_static_buffer_) {
+      for (int64_t batch = 0; batch < batch_size; ++batch) {
+        for (int64_t i = 0; i < buffer_length; ++i) {
+          mask_data[batch * buffer_length + i] = (i < valid_length) ? static_cast<T>(1) : static_cast<T>(0);
+        }
+      }
+    } else {
+      int64_t total_elements = batch_size * buffer_length;
+      for (int64_t i = 0; i < total_elements; ++i) {
+        mask_data[i] = static_cast<T>(1);
+      }
+    }
   }
 }
 
@@ -443,11 +218,9 @@ void WhisperDecoderState::UpdateAttentionMask(int current_length) {
       if (mask_type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32) {
         auto* mask_data = cpu_tensor->GetTensorMutableData<int32_t>();
         UpdateAttentionMaskStaticImpl<int32_t>(mask_data, batch_size, current_length, max_length);
-        WhisperLogAttentionMaskSummary("static_gpu", mask_data, batch_size, max_length, current_length);
       } else {
         auto* mask_data = cpu_tensor->GetTensorMutableData<int64_t>();
         UpdateAttentionMaskStaticImpl<int64_t>(mask_data, batch_size, current_length, max_length);
-        WhisperLogAttentionMaskSummary("static_gpu", mask_data, batch_size, max_length, current_length);
       }
 
       // Copy back to GPU
@@ -457,11 +230,9 @@ void WhisperDecoderState::UpdateAttentionMask(int current_length) {
       if (mask_type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32) {
         auto* mask_data = attention_mask_->GetTensorMutableData<int32_t>();
         UpdateAttentionMaskStaticImpl<int32_t>(mask_data, batch_size, current_length, max_length);
-        WhisperLogAttentionMaskSummary("static_cpu", mask_data, batch_size, max_length, current_length);
       } else {
         auto* mask_data = attention_mask_->GetTensorMutableData<int64_t>();
         UpdateAttentionMaskStaticImpl<int64_t>(mask_data, batch_size, current_length, max_length);
-        WhisperLogAttentionMaskSummary("static_cpu", mask_data, batch_size, max_length, current_length);
       }
     }
     // No need to update input pointer - using same buffer
@@ -494,14 +265,12 @@ void WhisperDecoderState::UpdateAttentionMask(int current_length) {
           next_data,
           cpu_current->GetTensorMutableData<int32_t>(),
           batch_size, old_seq_length, new_seq_length);
-        WhisperLogAttentionMaskSummary("dynamic_gpu", next_data, batch_size, new_seq_length, current_length);
       } else {
         auto* next_data = cpu_next->GetTensorMutableData<int64_t>();
         UpdateAttentionMaskDynamicImpl<int64_t>(
           next_data,
           cpu_current->GetTensorMutableData<int64_t>(),
           batch_size, old_seq_length, new_seq_length);
-        WhisperLogAttentionMaskSummary("dynamic_gpu", next_data, batch_size, new_seq_length, current_length);
       }
 
       // Create new GPU tensor and copy from CPU
@@ -524,7 +293,6 @@ void WhisperDecoderState::UpdateAttentionMask(int current_length) {
           next_data,
           attention_mask_->GetTensorMutableData<int32_t>(),
           batch_size, old_seq_length, new_seq_length);
-        WhisperLogAttentionMaskSummary("dynamic_cpu", next_data, batch_size, new_seq_length, current_length);
       } else {
         attention_mask_next_ = OrtValue::CreateTensor(
           allocator, attention_mask_shape_, mask_type_);
@@ -534,7 +302,6 @@ void WhisperDecoderState::UpdateAttentionMask(int current_length) {
           next_data,
           attention_mask_->GetTensorMutableData<int64_t>(),
           batch_size, old_seq_length, new_seq_length);
-        WhisperLogAttentionMaskSummary("dynamic_cpu", next_data, batch_size, new_seq_length, current_length);
       }
     }
 
@@ -552,80 +319,43 @@ void WhisperDecoderState::UpdateAttentionMask(int current_length) {
 }
 
 DeviceSpan<float> WhisperDecoderState::Run(int current_length, DeviceSpan<int32_t>& next_tokens, DeviceSpan<int32_t> next_indices) {
-  static int iteration = 0;
-  auto start_time = std::chrono::high_resolution_clock::now();
-
-  WHISPER_DEBUG_LOG("DECODER_ENTRY", "=== ITERATION " << ++iteration << " ===");
-  WHISPER_DEBUG_LOG("DECODER_ENTRY", "Phase: " << (first_run_ ? "CONTEXT" : "GENERATION"));
-  WHISPER_DEBUG_LOG("DECODER_ENTRY", "Current length: " << current_length);
-  WHISPER_DEBUG_LOG("DECODER_ENTRY", "Batch size: " << params_->BatchBeamSize());
-  WHISPER_DEBUG_LOG("DECODER_ENTRY", "Input sequence length: " << (next_tokens.size() / params_->BatchBeamSize()));
-  WHISPER_DEBUG_LOG("DECODER_ENTRY", "Total inputs: " << inputs_.size());
-  WHISPER_DEBUG_LOG("DECODER_ENTRY", "Total outputs: " << outputs_.size());
-  WHISPER_DEBUG_LOG("DECODER_ENTRY", "first_run_: " << first_run_ << " has_attention_mask_input_: " << has_attention_mask_input_);
-  std::cout.flush();  // Flush before potential crash points
-
   // Initialize attention_mask on first run (lazy initialization)
   if (first_run_ && has_attention_mask_input_) {
-    try {
-      WHISPER_DEBUG_LOG("DECODER_INIT", "Initializing attention mask..."); std::cout.flush();
-      // Get data type from model session
-      WHISPER_DEBUG_LOG("DECODER_INIT", "  Getting mask data type..."); std::cout.flush();
-      mask_type_ = model_.session_info_.GetInputDataType(model_.config_->model.decoder.inputs.attention_mask);
-      WHISPER_DEBUG_LOG("DECODER_INIT", "  mask_type_: " << mask_type_); std::cout.flush();
+    // Get data type from model session
+    mask_type_ = model_.session_info_.GetInputDataType(model_.config_->model.decoder.inputs.attention_mask);
 
-      // Validate type (must be INT32 or INT64)
-      if (mask_type_ != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32 &&
-          mask_type_ != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
-        throw std::runtime_error("attention_mask must be int32 or int64 type");
-      }
-
-      // Check if using in-place KV cache (static buffer)
-      WHISPER_DEBUG_LOG("DECODER_INIT", "  Checking static buffer mode..."); std::cout.flush();
-      use_static_buffer_ = params_->IsPastPresentShareBufferEnabled(model_.config_->model.type);
-      WHISPER_DEBUG_LOG("DECODER_INIT", "  use_static_buffer_: " << use_static_buffer_); std::cout.flush();
-
-      // Set shape based on mode:
-      // - Static buffer (in-place KV cache): pre-allocate to max_length
-      // - Dynamic mode: allocate to current_length
-      if (use_static_buffer_) {
-        attention_mask_shape_ = {params_->BatchBeamSize(), params_->search.max_length};
-      } else {
-        attention_mask_shape_ = {params_->BatchBeamSize(), current_length};
-      }
-      WHISPER_DEBUG_LOG("DECODER_INIT", "  attention_mask_shape_: [" << attention_mask_shape_[0] << ", " << attention_mask_shape_[1] << "]"); std::cout.flush();
-
-      // Create initial attention mask tensor
-      WHISPER_DEBUG_LOG("DECODER_INIT", "  Creating attention mask tensor (mask_type=" << mask_type_ << ")..."); std::cout.flush();
-      WHISPER_DEBUG_LOG("DECODER_INIT", "  About to call CreateAndInitializeAttentionMask..."); std::cout.flush();
-      if (mask_type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32) {
-        WHISPER_DEBUG_LOG("DECODER_INIT", "  Calling CreateAndInitializeAttentionMask<int32_t>..."); std::cout.flush();
-        CreateAndInitializeAttentionMask<int32_t>(current_length);
-      } else {
-        WHISPER_DEBUG_LOG("DECODER_INIT", "  Calling CreateAndInitializeAttentionMask<int64_t>..."); std::cout.flush();
-        CreateAndInitializeAttentionMask<int64_t>(current_length);
-      }
-      WHISPER_DEBUG_LOG("DECODER_INIT", "  Attention mask tensor created successfully"); std::cout.flush();
-
-      // Register as input
-      WHISPER_DEBUG_LOG("DECODER_INIT", "  Registering attention mask as input..."); std::cout.flush();
-      input_names_.push_back(model_.config_->model.decoder.inputs.attention_mask.c_str());
-      inputs_.push_back(attention_mask_.get());
-      WHISPER_DEBUG_LOG("DECODER_INIT", "Attention mask initialized"); std::cout.flush();
-    } catch (const std::exception& e) {
-      WHISPER_DEBUG_LOG("DECODER_INIT", "ERROR in attention mask init: " << e.what());
-      throw;
-    } catch (...) {
-      WHISPER_DEBUG_LOG("DECODER_INIT", "ERROR: Unknown exception in attention mask init");
-      throw;
+    // Validate type (must be INT32 or INT64)
+    if (mask_type_ != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32 &&
+        mask_type_ != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
+      throw std::runtime_error("attention_mask must be int32 or int64 type");
     }
-  }
 
-  WHISPER_DEBUG_LOG("DECODER_INIT", "Checking output_cross_qk...");
+    // Check if using in-place KV cache (static buffer)
+    use_static_buffer_ = params_->IsPastPresentShareBufferEnabled(model_.config_->model.type);
+
+    // Set shape based on mode:
+    // - Static buffer (in-place KV cache): pre-allocate to max_length
+    // - Dynamic mode: allocate to current_length
+    if (use_static_buffer_) {
+      attention_mask_shape_ = {params_->BatchBeamSize(), params_->search.max_length};
+    } else {
+      attention_mask_shape_ = {params_->BatchBeamSize(), current_length};
+    }
+
+    // Create initial attention mask tensor
+    if (mask_type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32) {
+      CreateAndInitializeAttentionMask<int32_t>(current_length);
+    } else {
+      CreateAndInitializeAttentionMask<int64_t>(current_length);
+    }
+
+    // Register as input
+    input_names_.push_back(model_.config_->model.decoder.inputs.attention_mask.c_str());
+    inputs_.push_back(attention_mask_.get());
+  }
 
   // Add output QK on first run
   if (first_run_ && model_.session_info_.HasOutput(output_cross_qk_name_)) {
-    WHISPER_DEBUG_LOG("DECODER_INIT", "Initializing output_cross_qk...");
     output_cross_qk_type_ = model_.session_info_.GetOutputDataType(output_cross_qk_name_);
     output_cross_qk_shape_ = std::array<int64_t, 4>{params_->BatchBeamSize(), model_.config_->model.decoder.num_attention_heads, current_length, num_frames_ / 2};
     output_cross_qk_index_ = outputs_.size();
@@ -640,85 +370,12 @@ DeviceSpan<float> WhisperDecoderState::Run(int current_length, DeviceSpan<int32_
       output_names_.emplace_back(output_cross_qk_names_.back().c_str());
       outputs_.emplace_back(output_cross_qk_.back().get());
     }
-    WHISPER_DEBUG_LOG("DECODER_INIT", "output_cross_qk initialized");
-  }
-
-  WHISPER_DEBUG_LOG("DECODER_INIT", "All initialization complete, about to log inputs...");
-
-  // Log all decoder inputs before ONNX session run
-  if (IsWhisperDebugEnabled()) {
-    WHISPER_DEBUG_LOG("DECODER_INPUTS", "Count: " << input_names_.size());
-    for (size_t i = 0; i < input_names_.size() && i < inputs_.size(); ++i) {
-      std::cout << "[WHISPER_DEBUG][INPUT_" << i << "] " << input_names_[i];
-      LogTensorShape(input_names_[i], inputs_[i]);
-
-      // Log attention_mask details
-      if (std::string(input_names_[i]) == "attention_mask" ||
-          std::string(input_names_[i]).find("attention_mask") != std::string::npos) {
-        std::cout << " (GPU tensor - values not accessible from CPU)";
-      }
-      // Log cross-attention KV cache
-      else if (std::string(input_names_[i]).find("past_key_cross") != std::string::npos ||
-               std::string(input_names_[i]).find("past_value_cross") != std::string::npos) {
-        std::cout << " [ENCODER KV]";
-      }
-      std::cout << std::endl;
-    }
-  }
-
-  // Dump all decoder inputs once (for token/value verification)
-  if (IsWhisperDumpInputsEnabled()) {
-    static bool dumped = false;
-    if (!dumped) {
-      dumped = true;
-      bool is_gpu = (model_.p_device_inputs_->GetType() != DeviceType::CPU);
-      std::string dump_dir = WhisperDumpDir();
-      WHISPER_DUMP_LOG("INPUTS", "Dumping decoder inputs to: " << dump_dir);
-      for (size_t i = 0; i < input_names_.size() && i < inputs_.size(); ++i) {
-        const std::string name = input_names_[i];
-        DumpOrtValueToFile(dump_dir, name, inputs_[i], *model_.p_device_inputs_, is_gpu);
-      }
-    }
   }
 
   if (model_.config_->model.decoder.run_options.has_value()) {
     State::SetRunOptions(model_.config_->model.decoder.run_options.value());
   }
-
-  try {
-    WHISPER_DEBUG_LOG("DECODER_RUN", "Calling ONNX Runtime session...");
-    std::cout.flush();  // Flush output before session run
-    State::Run(*model_.session_decoder_);
-    WHISPER_DEBUG_LOG("DECODER_RUN", "ONNX Runtime session completed");
-  } catch (const std::exception& e) {
-    WHISPER_DEBUG_LOG("DECODER_RUN", "ERROR in session run: " << e.what());
-    throw;
-  } catch (...) {
-    WHISPER_DEBUG_LOG("DECODER_RUN", "ERROR: Unknown exception in session run");
-    throw;
-  }
-
-  // Log decoder outputs
-  if (IsWhisperDebugEnabled()) {
-    WHISPER_DEBUG_LOG("DECODER_OUTPUTS", "Count: " << output_names_.size());
-    for (size_t i = 0; i < output_names_.size() && i < outputs_.size(); ++i) {
-      std::cout << "[WHISPER_DEBUG][OUTPUT_" << i << "] " << output_names_[i];
-      LogTensorShape(output_names_[i], outputs_[i]);
-      std::cout << std::endl;
-    }
-
-    // Check logits for NaN/Inf
-    auto logits = logits_.Get();
-    WHISPER_DEBUG_LOG("DECODER_OUTPUTS", "Logits shape: [" << params_->BatchBeamSize() << ", "
-                      << logits.size() / params_->BatchBeamSize() / model_.config_->model.vocab_size << ", "
-                      << model_.config_->model.vocab_size << "]");
-  }
-
-  auto end_time = std::chrono::high_resolution_clock::now();
-  auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-  WHISPER_DEBUG_LOG("DECODER_EXIT", "Status: SUCCESS");
-  WHISPER_DEBUG_LOG("DECODER_EXIT", "Execution time: " << duration << " ms");
-  WHISPER_DEBUG_LOG("DECODER_EXIT", "=== END ITERATION " << iteration << " ===\n");
+  State::Run(*model_.session_decoder_);
 
   return logits_.Get();
 }
@@ -727,33 +384,23 @@ void WhisperDecoderState::UpdateInputsOutputs(DeviceSpan<int32_t>& next_tokens, 
   int batch_size = static_cast<int>(input_ids_.GetShape()[0]);
   size_t new_length = next_tokens.size() / batch_size;
 
-  WHISPER_DEBUG_LOG("UPDATE_INPUTS", "Current length: " << current_length << ", New length: " << new_length);
-  WHISPER_DEBUG_LOG("UPDATE_INPUTS", "First update: " << (first_update ? "YES" : "NO") << ", First run: " << (first_run_ ? "YES" : "NO"));
-
   input_ids_.Update(next_tokens);
   kv_cache_->Update(beam_indices, current_length);
   logits_.Update(next_tokens, first_run_ ? current_length : new_length);
 
   // Return early if this method is just initializing the above OrtValue objects and not updating them
   if (first_run_) {
-    WHISPER_DEBUG_LOG("UPDATE_INPUTS", "First run - initialization only, returning early");
     return;
   }
 
   if (past_sequence_length_) {
     auto data = past_sequence_length_->GetTensorMutableData<int32_t>();
     *data = current_length - 1;
-    WHISPER_DEBUG_LOG("UPDATE_INPUTS", "Updated past_sequence_length: " << *data);
   }
 
   // Update attention_mask if model supports it (GQA in-place KV cache)
   if (has_attention_mask_input_) {
-    WHISPER_DEBUG_LOG("ATTENTION_MASK", "Before update - shape: [" << attention_mask_shape_[0] << ", " << attention_mask_shape_[1] << "]");
-    WHISPER_DEBUG_LOG("ATTENTION_MASK", "Updating for current_length=" << current_length);
-
     UpdateAttentionMask(current_length);
-
-    WHISPER_DEBUG_LOG("ATTENTION_MASK", "After update - shape: [" << attention_mask_shape_[0] << ", " << attention_mask_shape_[1] << "]");
   }
 
   if (cache_indirection_ && params_->search.num_beams > 1 && !first_update) {
