@@ -133,6 +133,10 @@ void WhisperDecoderState::CreateAndInitializeAttentionMask(int64_t valid_length)
     }
   } else if (model_.p_device_inputs_->GetType() != DeviceType::CPU) {
     // Other GPU path (non-TRT-RTX or dynamic mode): Create on CPU, initialize, then copy full buffer to GPU
+    // NOTE: For TRT-RTX EP with past_present_share_buffer=true, this path should NEVER be reached.
+    // Only the optimized TRT-RTX branch above (is_trt_rtx && use_static_buffer_) should execute.
+    assert(!is_trt_rtx && "CreateAndInitializeAttentionMask: TRT-RTX with static buffer should use optimized GPU-only path, not this CPU-to-GPU copy path");
+
     auto& cpu_allocator = GetDeviceInterface(DeviceType::CPU)->GetAllocator();
     auto cpu_tensor = OrtValue::CreateTensor(cpu_allocator, attention_mask_shape_, mask_type_);
 
@@ -164,6 +168,9 @@ void WhisperDecoderState::CreateAndInitializeAttentionMask(int64_t valid_length)
     gpu_span.CopyFrom(cpu_span);
   } else {
     // CPU path: Create and initialize directly
+    // NOTE: For TRT-RTX EP, this path should NEVER be reached (TRT-RTX is a GPU execution provider).
+    assert(!is_trt_rtx && "CreateAndInitializeAttentionMask: TRT-RTX EP should not use CPU path");
+
     auto& allocator = model_.p_device_inputs_->GetAllocator();
     attention_mask_ = OrtValue::CreateTensor(allocator, attention_mask_shape_, mask_type_);
 
@@ -191,6 +198,11 @@ void WhisperDecoderState::UpdateAttentionMaskStaticImpl(
     int64_t batch_size,
     int64_t current_length,
     int64_t max_length) {
+  // NOTE: This CPU implementation should NEVER be called for TRT-RTX EP.
+  // TRT-RTX uses GPU kernel via model_.p_device_inputs_->UpdateAttentionMask().
+  // This function is kept for potential future use with other EPs.
+  assert(false && "UpdateAttentionMaskStaticImpl: CPU fallback should not be called for TRT-RTX EP");
+
   // Static buffer mode: Update in-place by setting position current_length-1 to 1
   // Example: if current_length=5, set mask[4] = 1 (0-indexed)
   // Buffer is pre-allocated: [1,1,1,1,0,0,...,0] -> [1,1,1,1,1,0,...,0]
@@ -208,6 +220,11 @@ void WhisperDecoderState::UpdateAttentionMaskDynamicImpl(
     int64_t batch_size,
     int64_t old_seq_length,
     int64_t new_seq_length) {
+  // NOTE: This CPU implementation should NEVER be called for TRT-RTX EP.
+  // TRT-RTX uses GPU kernel via model_.p_device_inputs_->UpdateAttentionMask().
+  // This function is kept for potential future use with other EPs.
+  assert(false && "UpdateAttentionMaskDynamicImpl: CPU fallback should not be called for TRT-RTX EP");
+
   // Dynamic mode: Copy old mask + append 1s for new tokens
   for (int64_t i = 0; i < batch_size; ++i) {
     // Copy existing mask values
@@ -263,6 +280,10 @@ void WhisperDecoderState::UpdateAttentionMask(int current_length, int new_kv_len
   }
 
   // Dynamic mode: create new tensor with expanded length
+  // NOTE: For TRT-RTX EP with past_present_share_buffer=true, this path should NEVER be reached.
+  // use_static_buffer_ should be true, so we return above.
+  assert(!is_trt_rtx && "TRT-RTX EP with shared buffer should use static mode, not dynamic mode");
+
   attention_mask_shape_[1] = current_length;
   attention_mask_next_ = OrtValue::CreateTensor(model_.p_device_inputs_->GetAllocator(), attention_mask_shape_, mask_type_);
 
