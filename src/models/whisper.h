@@ -74,7 +74,7 @@ struct WhisperDecoderState : State {
   template <typename T>
   void UpdateAttentionMaskDynamicImpl(T* next_mask_data, const T* current_mask_data, int64_t batch_size, int64_t old_seq_length, int64_t new_seq_length);
 
-  void UpdateAttentionMask(int current_length);
+  void UpdateAttentionMask(int current_length, int new_kv_length);
 
   const WhisperModel& model_;
 
