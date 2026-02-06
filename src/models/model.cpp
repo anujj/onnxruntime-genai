@@ -394,9 +394,19 @@ void ConfigureNvTensorRtRtxProfile(const Config& config, OrtSessionOptions& sess
   // Get max context length from config
   const int max_context_len = config.model.context_length;
 
-  // Extract KV cache name patterns from decoder config
+  // Extract KV cache name patterns from decoder config (self-attention)
   std::string_view past_key_pattern = config.model.decoder.inputs.past_key_names;
   std::string_view past_value_pattern = config.model.decoder.inputs.past_value_names;
+
+  // Extract cross-attention KV cache name patterns (for encoder-decoder models like Whisper)
+  std::string_view cross_past_key_pattern = config.model.decoder.inputs.cross_past_key_names;
+  std::string_view cross_past_value_pattern = config.model.decoder.inputs.cross_past_value_names;
+  const bool has_cross_attention = !cross_past_key_pattern.empty() && !cross_past_value_pattern.empty();
+
+  // Cross-attention uses fixed encoder sequence length (e.g., 1500 for Whisper = 3000 frames / 2)
+  // This is the encoder output sequence length, which is constant for a given model
+  constexpr int whisper_encoder_seq_len = 1500;  // Whisper: 30 seconds * 100 fps / 2 = 1500
+  const int cross_attention_seq_len = (config.model.type == "whisper") ? whisper_encoder_seq_len : 0;
 
   // Helper function to add KV cache with sequence length
   const auto add_key_value_cache_shapes = [](std::ostringstream& shapes,
@@ -473,6 +483,21 @@ void ConfigureNvTensorRtRtxProfile(const Config& config, OrtSessionOptions& sess
     add_generation_input_shapes(max_shapes, batch_size, max_context_len);
     add_key_value_cache_shapes(max_shapes, batch_size, past_key_pattern, past_value_pattern, max_context_len - 1, num_layers, num_kv_heads, head_dim);
 
+    // Add cross-attention cache shapes if present (encoder-decoder models like Whisper)
+    // Cross-attention caches have FIXED encoder sequence length (doesn't change during generation)
+    if (has_cross_attention && cross_attention_seq_len > 0) {
+      // Cross-attention uses num_attention_heads (not num_kv_heads) because encoder K/V aren't grouped
+      const int cross_num_heads = config.model.decoder.num_attention_heads;
+
+      // Add cross-attention cache shapes to all profiles (same fixed seq_len for all)
+      add_key_value_cache_shapes(min_shapes, batch_size, cross_past_key_pattern, cross_past_value_pattern,
+                                 cross_attention_seq_len, num_layers, cross_num_heads, head_dim);
+      add_key_value_cache_shapes(opt_shapes, batch_size, cross_past_key_pattern, cross_past_value_pattern,
+                                 cross_attention_seq_len, num_layers, cross_num_heads, head_dim);
+      add_key_value_cache_shapes(max_shapes, batch_size, cross_past_key_pattern, cross_past_value_pattern,
+                                 cross_attention_seq_len, num_layers, cross_num_heads, head_dim);
+    }
+
     // Add the constructed profiles to session options
     session_options.AddConfigEntry("ep.nvtensorrtrtxexecutionprovider.nv_profile_min_shapes", min_shapes.str().c_str());
     session_options.AddConfigEntry("ep.nvtensorrtrtxexecutionprovider.nv_profile_opt_shapes", opt_shapes.str().c_str());
@@ -500,6 +525,22 @@ void ConfigureNvTensorRtRtxProfile(const Config& config, OrtSessionOptions& sess
     max_shapes << Config::Defaults::InputIdsName << ":" << batch_size << "x" << max_context_len << ","
                << Config::Defaults::AttentionMaskName << ":" << batch_size << "x" << max_context_len;
     add_key_value_cache_shapes(max_shapes, batch_size, past_key_pattern, past_value_pattern, max_context_len, num_layers, num_kv_heads, head_dim);
+
+    // Add cross-attention cache shapes if present (encoder-decoder models like Whisper)
+    // Cross-attention caches have FIXED encoder sequence length (doesn't change during generation)
+    if (has_cross_attention && cross_attention_seq_len > 0) {
+      // Cross-attention uses num_attention_heads (not num_kv_heads) because encoder K/V aren't grouped
+      const int cross_num_heads = config.model.decoder.num_attention_heads;
+
+      // Add cross-attention cache shapes to all profiles (same fixed seq_len for all)
+      // Note: For single-profile, min uses min_batch_size, opt uses opt_batch_size, max uses batch_size
+      add_key_value_cache_shapes(min_shapes, min_batch_size, cross_past_key_pattern, cross_past_value_pattern,
+                                 cross_attention_seq_len, num_layers, cross_num_heads, head_dim);
+      add_key_value_cache_shapes(opt_shapes, opt_batch_size, cross_past_key_pattern, cross_past_value_pattern,
+                                 cross_attention_seq_len, num_layers, cross_num_heads, head_dim);
+      add_key_value_cache_shapes(max_shapes, batch_size, cross_past_key_pattern, cross_past_value_pattern,
+                                 cross_attention_seq_len, num_layers, cross_num_heads, head_dim);
+    }
 
     // Add the constructed profiles to session options
     session_options.AddConfigEntry("ep.nvtensorrtrtxexecutionprovider.nv_profile_min_shapes", min_shapes.str().c_str());

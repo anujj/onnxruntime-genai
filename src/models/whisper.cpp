@@ -2,9 +2,7 @@
 // Licensed under the MIT License.
 #include "../generators.h"
 #include "whisper.h"
-
 namespace Generators {
-
 WhisperModel::WhisperModel(std::unique_ptr<Config> config, OrtEnv& ort_env)
     : Model{std::move(config)} {
   encoder_session_options_ = OrtSessionOptions::Create();
@@ -85,10 +83,218 @@ WhisperDecoderState::WhisperDecoderState(const WhisperModel& model, const Genera
     ByteWrapTensor(*model_.p_device_inputs_, *cache_indirection_).Zero();
   }
 
+  // attention_mask is only supported for NvTensorRtRtx EP
+  const bool is_trt_rtx = model_.p_device_inputs_->GetType() == DeviceType::NvTensorRtRtx;
+  has_attention_mask_input_ = is_trt_rtx && HasAttentionMaskInput();
+  // Note: attention_mask will be initialized lazily on first run when current_length is known
+
+  // position_ids input (optional)
+  has_position_ids_input_ = model_.session_info_.HasInput(model_.config_->model.decoder.inputs.position_ids);
+
   output_cross_qk_name_ = ComposeKeyValueName(model_.config_->model.decoder.outputs.output_cross_qk_names, 0);
 }
 
+template <typename T>
+void WhisperDecoderState::CreateAndInitializeAttentionMask(int64_t valid_length) {
+  int64_t batch_size = attention_mask_shape_[0];
+  int64_t buffer_length = attention_mask_shape_[1];  // max_length for static, current length for dynamic
+
+  // Check if we're on GPU - if so, we need to create on CPU first, then copy
+  bool is_gpu = (model_.p_device_inputs_->GetType() != DeviceType::CPU);
+
+  if (is_gpu) {
+    // GPU path: Create on CPU, initialize, then copy to GPU
+    auto& cpu_allocator = GetDeviceInterface(DeviceType::CPU)->GetAllocator();
+    auto cpu_tensor = OrtValue::CreateTensor(cpu_allocator, attention_mask_shape_, mask_type_);
+
+    auto* mask_data = cpu_tensor->GetTensorMutableData<T>();
+
+    // Initialize mask values on CPU
+    if (use_static_buffer_) {
+      // For static buffer: valid tokens followed by padding
+      for (int64_t batch = 0; batch < batch_size; ++batch) {
+        for (int64_t i = 0; i < buffer_length; ++i) {
+          mask_data[batch * buffer_length + i] = (i < valid_length) ? static_cast<T>(1) : static_cast<T>(0);
+        }
+      }
+    } else {
+      // For dynamic mode: all tokens are valid (no pre-allocated padding)
+      int64_t total_elements = batch_size * buffer_length;
+      for (int64_t i = 0; i < total_elements; ++i) {
+        mask_data[i] = static_cast<T>(1);
+      }
+    }
+
+    // Create GPU tensor
+    auto& gpu_allocator = model_.p_device_inputs_->GetAllocator();
+    attention_mask_ = OrtValue::CreateTensor(gpu_allocator, attention_mask_shape_, mask_type_);
+
+    // Copy CPU to GPU
+    auto cpu_span = ByteWrapTensor(*GetDeviceInterface(DeviceType::CPU), *cpu_tensor);
+    auto gpu_span = ByteWrapTensor(*model_.p_device_inputs_, *attention_mask_);
+    gpu_span.CopyFrom(cpu_span);
+  } else {
+    // CPU path: Create and initialize directly
+    auto& allocator = model_.p_device_inputs_->GetAllocator();
+    attention_mask_ = OrtValue::CreateTensor(allocator, attention_mask_shape_, mask_type_);
+
+    auto* mask_data = attention_mask_->GetTensorMutableData<T>();
+
+    // Initialize mask values
+    if (use_static_buffer_) {
+      for (int64_t batch = 0; batch < batch_size; ++batch) {
+        for (int64_t i = 0; i < buffer_length; ++i) {
+          mask_data[batch * buffer_length + i] = (i < valid_length) ? static_cast<T>(1) : static_cast<T>(0);
+        }
+      }
+    } else {
+      int64_t total_elements = batch_size * buffer_length;
+      for (int64_t i = 0; i < total_elements; ++i) {
+        mask_data[i] = static_cast<T>(1);
+      }
+    }
+  }
+}
+
+template <typename T>
+void WhisperDecoderState::UpdateAttentionMaskStaticImpl(
+    T* mask_data,
+    int64_t batch_size,
+    int64_t current_length,
+    int64_t max_length) {
+  // Static buffer mode: Update in-place by setting position current_length-1 to 1
+  // Example: if current_length=5, set mask[4] = 1 (0-indexed)
+  // Buffer is pre-allocated: [1,1,1,1,0,0,...,0] -> [1,1,1,1,1,0,...,0]
+  for (int64_t batch = 0; batch < batch_size; ++batch) {
+    if (current_length - 1 < max_length) {
+      mask_data[batch * max_length + (current_length - 1)] = 1;
+    }
+  }
+}
+
+template <typename T>
+void WhisperDecoderState::UpdateAttentionMaskDynamicImpl(
+    T* next_mask_data,
+    const T* current_mask_data,
+    int64_t batch_size,
+    int64_t old_seq_length,
+    int64_t new_seq_length) {
+  // Dynamic mode: Copy old mask + append 1s for new tokens
+  for (int64_t i = 0; i < batch_size; ++i) {
+    // Copy existing mask values
+    for (int64_t j = 0; j < old_seq_length; ++j) {
+      next_mask_data[i * new_seq_length + j] =
+        current_mask_data[i * old_seq_length + j];
+    }
+    // Append 1s for new tokens
+    for (int64_t j = old_seq_length; j < new_seq_length; ++j) {
+      next_mask_data[i * new_seq_length + j] = 1;
+    }
+  }
+}
+
+void WhisperDecoderState::UpdateAttentionMask(int current_length, int new_kv_length) {
+  int64_t batch_size = attention_mask_shape_[0];
+
+  if (use_static_buffer_) {
+    // Static buffer mode: update in-place
+    int64_t max_length = attention_mask_shape_[1];
+    if (!model_.p_device_inputs_->UpdateAttentionMask(nullptr,
+                                                      attention_mask_->GetTensorMutableRawData(),
+                                                      static_cast<int>(batch_size),
+                                                      new_kv_length,
+                                                      current_length,
+                                                      static_cast<int>(max_length),
+                                                      true,
+                                                      mask_type_)) {
+      auto attention_mask_span = ByteWrapTensor(*model_.p_device_inputs_, *attention_mask_);
+      GetDeviceInterface(DeviceType::CPU)->UpdateAttentionMask(nullptr,
+                                                               attention_mask_span.CopyDeviceToCpu().data(),
+                                                               static_cast<int>(batch_size),
+                                                               new_kv_length,
+                                                               current_length,
+                                                               static_cast<int>(max_length),
+                                                               true,
+                                                               mask_type_);
+      attention_mask_span.CopyCpuToDevice();
+    }
+    return;
+  }
+
+  // Dynamic mode: create new tensor with expanded length
+  attention_mask_shape_[1] = current_length;
+  attention_mask_next_ = OrtValue::CreateTensor(model_.p_device_inputs_->GetAllocator(), attention_mask_shape_, mask_type_);
+
+  if (!model_.p_device_inputs_->UpdateAttentionMask(attention_mask_next_->GetTensorMutableRawData(),
+                                                    attention_mask_->GetTensorMutableRawData(),
+                                                    static_cast<int>(batch_size),
+                                                    new_kv_length,
+                                                    current_length,
+                                                    params_->search.max_length,
+                                                    false,
+                                                    mask_type_)) {
+    auto attention_mask_next_span = ByteWrapTensor(*model_.p_device_inputs_, *attention_mask_next_);
+    auto attention_mask_span = ByteWrapTensor(*model_.p_device_inputs_, *attention_mask_);
+    GetDeviceInterface(DeviceType::CPU)->UpdateAttentionMask(attention_mask_next_span.CopyDeviceToCpu().data(),
+                                                             attention_mask_span.CopyDeviceToCpu().data(),
+                                                             static_cast<int>(batch_size),
+                                                             new_kv_length,
+                                                             current_length,
+                                                             params_->search.max_length,
+                                                             false,
+                                                             mask_type_);
+    attention_mask_next_span.CopyCpuToDevice();
+    attention_mask_span.CopyCpuToDevice();
+  }
+
+  // Swap: next becomes current
+  std::swap(attention_mask_, attention_mask_next_);
+
+  // Update input pointer
+  for (size_t i = 0; i < input_names_.size(); ++i) {
+    if (input_names_[i] == model_.config_->model.decoder.inputs.attention_mask) {
+      inputs_[i] = attention_mask_.get();
+      break;
+    }
+  }
+}
+
 DeviceSpan<float> WhisperDecoderState::Run(int current_length, DeviceSpan<int32_t>& next_tokens, DeviceSpan<int32_t> next_indices) {
+  // Initialize attention_mask on first run (lazy initialization)
+  if (first_run_ && has_attention_mask_input_) {
+    // Get data type from model session
+    mask_type_ = model_.session_info_.GetInputDataType(model_.config_->model.decoder.inputs.attention_mask);
+
+    // Validate type (must be INT32 or INT64)
+    if (mask_type_ != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32 &&
+        mask_type_ != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
+      throw std::runtime_error("attention_mask must be int32 or int64 type");
+    }
+
+    // Check if using in-place KV cache (static buffer)
+    use_static_buffer_ = params_->IsPastPresentShareBufferEnabled(model_.config_->model.type);
+
+    // Set shape based on mode:
+    // - Static buffer (in-place KV cache): pre-allocate to max_length
+    // - Dynamic mode: allocate to current_length
+    if (use_static_buffer_) {
+      attention_mask_shape_ = {params_->BatchBeamSize(), params_->search.max_length};
+    } else {
+      attention_mask_shape_ = {params_->BatchBeamSize(), current_length};
+    }
+
+    // Create initial attention mask tensor
+    if (mask_type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32) {
+      CreateAndInitializeAttentionMask<int32_t>(current_length);
+    } else {
+      CreateAndInitializeAttentionMask<int64_t>(current_length);
+    }
+
+    // Register as input
+    input_names_.push_back(model_.config_->model.decoder.inputs.attention_mask.c_str());
+    inputs_.push_back(attention_mask_.get());
+  }
+
   // Add output QK on first run
   if (first_run_ && model_.session_info_.HasOutput(output_cross_qk_name_)) {
     output_cross_qk_type_ = model_.session_info_.GetOutputDataType(output_cross_qk_name_);
@@ -111,15 +317,52 @@ DeviceSpan<float> WhisperDecoderState::Run(int current_length, DeviceSpan<int32_
     State::SetRunOptions(model_.config_->model.decoder.run_options.value());
   }
   State::Run(*model_.session_decoder_);
+
   return logits_.Get();
 }
 
 void WhisperDecoderState::UpdateInputsOutputs(DeviceSpan<int32_t>& next_tokens, DeviceSpan<int32_t> beam_indices, int current_length, bool first_update) {
   int batch_size = static_cast<int>(input_ids_.GetShape()[0]);
   size_t new_length = next_tokens.size() / batch_size;
+
   input_ids_.Update(next_tokens);
   kv_cache_->Update(beam_indices, current_length);
   logits_.Update(next_tokens, first_run_ ? current_length : new_length);
+
+  // Update position_ids if model expects it
+  if (has_position_ids_input_) {
+    const auto& pos_name = model_.config_->model.decoder.inputs.position_ids;
+    if (position_ids_index_ == ~0U) {
+      position_ids_type_ = model_.session_info_.GetInputDataType(pos_name);
+      if (position_ids_type_ != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32 &&
+          position_ids_type_ != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
+        throw std::runtime_error("position_ids must be int32 or int64 type");
+      }
+      position_ids_shape_ = {params_->BatchBeamSize(), static_cast<int64_t>(new_length)};
+      position_ids_ = OrtValue::CreateTensor(model_.p_device_inputs_->GetAllocator(), position_ids_shape_, position_ids_type_);
+      position_ids_index_ = inputs_.size();
+      input_names_.push_back(pos_name.c_str());
+      inputs_.push_back(position_ids_.get());
+    } else if (position_ids_shape_[1] != static_cast<int64_t>(new_length)) {
+      position_ids_shape_[1] = static_cast<int64_t>(new_length);
+      position_ids_ = OrtValue::CreateTensor(model_.p_device_inputs_->GetAllocator(), position_ids_shape_, position_ids_type_);
+      inputs_[position_ids_index_] = position_ids_.get();
+    }
+
+    if (!model_.p_device_inputs_->UpdatePositionIds(position_ids_->GetTensorMutableRawData(),
+                                                    static_cast<int>(position_ids_shape_[0]),
+                                                    current_length,
+                                                    static_cast<int>(new_length),
+                                                    position_ids_type_)) {
+      auto position_ids_span = ByteWrapTensor(*model_.p_device_inputs_, *position_ids_);
+      GetDeviceInterface(DeviceType::CPU)->UpdatePositionIds(position_ids_span.CopyDeviceToCpu().data(),
+                                                            static_cast<int>(position_ids_shape_[0]),
+                                                            current_length,
+                                                            static_cast<int>(new_length),
+                                                            position_ids_type_);
+      position_ids_span.CopyCpuToDevice();
+    }
+  }
 
   // Return early if this method is just initializing the above OrtValue objects and not updating them
   if (first_run_) {
@@ -129,6 +372,11 @@ void WhisperDecoderState::UpdateInputsOutputs(DeviceSpan<int32_t>& next_tokens, 
   if (past_sequence_length_) {
     auto data = past_sequence_length_->GetTensorMutableData<int32_t>();
     *data = current_length - 1;
+  }
+
+  // Update attention_mask if model supports it (GQA in-place KV cache)
+  if (has_attention_mask_input_) {
+    UpdateAttentionMask(current_length, static_cast<int>(new_length));
   }
 
   if (cache_indirection_ && params_->search.num_beams > 1 && !first_update) {
@@ -166,6 +414,7 @@ void WhisperDecoderState::UpdateInputsOutputs(DeviceSpan<int32_t>& next_tokens, 
       outputs_[output_cross_qk_index_ + i] = output_cross_qk_[i].get();
     }
   }
+
 }
 
 WhisperState::WhisperState(const WhisperModel& model, const GeneratorParams& params, DeviceSpan<int32_t> sequence_lengths_unk)
@@ -427,5 +676,13 @@ OrtValue* WhisperState::GetOutput(const char* name) {
 
   return State::GetOutput(name);
 };
+
+// Explicit template instantiations
+template void WhisperDecoderState::CreateAndInitializeAttentionMask<int32_t>(int64_t valid_length);
+template void WhisperDecoderState::CreateAndInitializeAttentionMask<int64_t>(int64_t valid_length);
+template void WhisperDecoderState::UpdateAttentionMaskStaticImpl<int32_t>(int32_t* mask_data, int64_t batch_size, int64_t current_length, int64_t max_length);
+template void WhisperDecoderState::UpdateAttentionMaskStaticImpl<int64_t>(int64_t* mask_data, int64_t batch_size, int64_t current_length, int64_t max_length);
+template void WhisperDecoderState::UpdateAttentionMaskDynamicImpl<int32_t>(int32_t* next_mask_data, const int32_t* current_mask_data, int64_t batch_size, int64_t old_seq_length, int64_t new_seq_length);
+template void WhisperDecoderState::UpdateAttentionMaskDynamicImpl<int64_t>(int64_t* next_mask_data, const int64_t* current_mask_data, int64_t batch_size, int64_t old_seq_length, int64_t new_seq_length);
 
 }  // namespace Generators
