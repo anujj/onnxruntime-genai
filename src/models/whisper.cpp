@@ -88,6 +88,9 @@ WhisperDecoderState::WhisperDecoderState(const WhisperModel& model, const Genera
   has_attention_mask_input_ = is_trt_rtx && HasAttentionMaskInput();
   // Note: attention_mask will be initialized lazily on first run when current_length is known
 
+  // position_ids input (optional)
+  has_position_ids_input_ = model_.session_info_.HasInput(model_.config_->model.decoder.inputs.position_ids);
+
   output_cross_qk_name_ = ComposeKeyValueName(model_.config_->model.decoder.outputs.output_cross_qk_names, 0);
 }
 
@@ -96,47 +99,11 @@ void WhisperDecoderState::CreateAndInitializeAttentionMask(int64_t valid_length)
   int64_t batch_size = attention_mask_shape_[0];
   int64_t buffer_length = attention_mask_shape_[1];  // max_length for static, current length for dynamic
 
-  // Check if we're on GPU (TRT-RTX EP)
-  const bool is_trt_rtx = (model_.p_device_inputs_->GetType() == DeviceType::NvTensorRtRtx);
+  // Check if we're on GPU - if so, we need to create on CPU first, then copy
+  bool is_gpu = (model_.p_device_inputs_->GetType() != DeviceType::CPU);
 
-  if (is_trt_rtx && use_static_buffer_) {
-    // TRT-RTX with static buffer: GPU-only initialization (matches LLM pattern in position_inputs.cpp)
-    // 1. Create GPU tensor and zero it
-    // 2. Create small CPU tensor with only valid_length elements (all 1s)
-    // 3. Copy only the valid portion from CPU to GPU (no full buffer copy)
-
-    auto& gpu_allocator = model_.p_device_inputs_->GetAllocator();
-    attention_mask_ = OrtValue::CreateTensor(gpu_allocator, attention_mask_shape_, mask_type_);
-
-    // Zero the entire GPU tensor
-    auto gpu_span = WrapTensor<T>(*model_.p_device_inputs_, *attention_mask_);
-    gpu_span.Zero();
-
-    // Create small CPU tensor with only valid_length elements
-    auto& cpu_allocator = GetDeviceInterface(DeviceType::CPU)->GetAllocator();
-    std::array<int64_t, 2> valid_shape = {batch_size, valid_length};
-    auto cpu_valid_tensor = OrtValue::CreateTensor(cpu_allocator, valid_shape, mask_type_);
-    auto* cpu_mask_data = cpu_valid_tensor->GetTensorMutableData<T>();
-
-    // Fill CPU tensor with 1s (all valid tokens)
-    int64_t valid_elements = batch_size * valid_length;
-    for (int64_t i = 0; i < valid_elements; ++i) {
-      cpu_mask_data[i] = static_cast<T>(1);
-    }
-
-    // Copy only the valid portion from CPU to GPU for each batch
-    auto cpu_span = WrapTensor<T>(*GetDeviceInterface(DeviceType::CPU), *cpu_valid_tensor);
-    for (int64_t batch = 0; batch < batch_size; ++batch) {
-      auto gpu_subspan = gpu_span.subspan(batch * buffer_length, valid_length);
-      auto cpu_subspan = cpu_span.subspan(batch * valid_length, valid_length);
-      gpu_subspan.CopyFrom(cpu_subspan);
-    }
-  } else if (model_.p_device_inputs_->GetType() != DeviceType::CPU) {
-    // Other GPU path (non-TRT-RTX or dynamic mode): Create on CPU, initialize, then copy full buffer to GPU
-    // NOTE: For TRT-RTX EP with past_present_share_buffer=true, this path should NEVER be reached.
-    // Only the optimized TRT-RTX branch above (is_trt_rtx && use_static_buffer_) should execute.
-    assert(!is_trt_rtx && "CreateAndInitializeAttentionMask: TRT-RTX with static buffer should use optimized GPU-only path, not this CPU-to-GPU copy path");
-
+  if (is_gpu) {
+    // GPU path: Create on CPU, initialize, then copy to GPU
     auto& cpu_allocator = GetDeviceInterface(DeviceType::CPU)->GetAllocator();
     auto cpu_tensor = OrtValue::CreateTensor(cpu_allocator, attention_mask_shape_, mask_type_);
 
@@ -168,9 +135,6 @@ void WhisperDecoderState::CreateAndInitializeAttentionMask(int64_t valid_length)
     gpu_span.CopyFrom(cpu_span);
   } else {
     // CPU path: Create and initialize directly
-    // NOTE: For TRT-RTX EP, this path should NEVER be reached (TRT-RTX is a GPU execution provider).
-    assert(!is_trt_rtx && "CreateAndInitializeAttentionMask: TRT-RTX EP should not use CPU path");
-
     auto& allocator = model_.p_device_inputs_->GetAllocator();
     attention_mask_ = OrtValue::CreateTensor(allocator, attention_mask_shape_, mask_type_);
 
@@ -198,11 +162,6 @@ void WhisperDecoderState::UpdateAttentionMaskStaticImpl(
     int64_t batch_size,
     int64_t current_length,
     int64_t max_length) {
-  // NOTE: This CPU implementation should NEVER be called for TRT-RTX EP.
-  // TRT-RTX uses GPU kernel via model_.p_device_inputs_->UpdateAttentionMask().
-  // This function is kept for potential future use with other EPs.
-  assert(false && "UpdateAttentionMaskStaticImpl: CPU fallback should not be called for TRT-RTX EP");
-
   // Static buffer mode: Update in-place by setting position current_length-1 to 1
   // Example: if current_length=5, set mask[4] = 1 (0-indexed)
   // Buffer is pre-allocated: [1,1,1,1,0,0,...,0] -> [1,1,1,1,1,0,...,0]
@@ -220,11 +179,6 @@ void WhisperDecoderState::UpdateAttentionMaskDynamicImpl(
     int64_t batch_size,
     int64_t old_seq_length,
     int64_t new_seq_length) {
-  // NOTE: This CPU implementation should NEVER be called for TRT-RTX EP.
-  // TRT-RTX uses GPU kernel via model_.p_device_inputs_->UpdateAttentionMask().
-  // This function is kept for potential future use with other EPs.
-  assert(false && "UpdateAttentionMaskDynamicImpl: CPU fallback should not be called for TRT-RTX EP");
-
   // Dynamic mode: Copy old mask + append 1s for new tokens
   for (int64_t i = 0; i < batch_size; ++i) {
     // Copy existing mask values
@@ -242,29 +196,17 @@ void WhisperDecoderState::UpdateAttentionMaskDynamicImpl(
 void WhisperDecoderState::UpdateAttentionMask(int current_length, int new_kv_length) {
   int64_t batch_size = attention_mask_shape_[0];
 
-  // Note: attention_mask is only used for NvTensorRtRtx EP (see constructor line 87-88)
-  // The CUDA/TRT-RTX GPU implementation of UpdateAttentionMask always returns true,
-  // so no CPU fallback should ever occur. We use asserts to verify this assumption.
-  const bool is_trt_rtx = (model_.p_device_inputs_->GetType() == DeviceType::NvTensorRtRtx);
-
   if (use_static_buffer_) {
-    // Static buffer mode: update in-place on GPU
+    // Static buffer mode: update in-place
     int64_t max_length = attention_mask_shape_[1];
-    bool gpu_update_success = model_.p_device_inputs_->UpdateAttentionMask(nullptr,
+    if (!model_.p_device_inputs_->UpdateAttentionMask(nullptr,
                                                       attention_mask_->GetTensorMutableRawData(),
                                                       static_cast<int>(batch_size),
                                                       new_kv_length,
                                                       current_length,
                                                       static_cast<int>(max_length),
                                                       true,
-                                                      mask_type_);
-
-    // For TRT-RTX EP, GPU update must always succeed - no CPU fallback needed
-    if (is_trt_rtx) {
-      assert(gpu_update_success && "TRT-RTX EP: GPU UpdateAttentionMask must succeed, CPU fallback not expected");
-      (void)gpu_update_success;  // Suppress unused variable warning in release builds
-    } else if (!gpu_update_success) {
-      // CPU fallback for non-TRT-RTX EPs (should not happen for CUDA either, but kept for safety)
+                                                      mask_type_)) {
       auto attention_mask_span = ByteWrapTensor(*model_.p_device_inputs_, *attention_mask_);
       GetDeviceInterface(DeviceType::CPU)->UpdateAttentionMask(nullptr,
                                                                attention_mask_span.CopyDeviceToCpu().data(),
@@ -280,28 +222,17 @@ void WhisperDecoderState::UpdateAttentionMask(int current_length, int new_kv_len
   }
 
   // Dynamic mode: create new tensor with expanded length
-  // NOTE: For TRT-RTX EP with past_present_share_buffer=true, this path should NEVER be reached.
-  // use_static_buffer_ should be true, so we return above.
-  assert(!is_trt_rtx && "TRT-RTX EP with shared buffer should use static mode, not dynamic mode");
-
   attention_mask_shape_[1] = current_length;
   attention_mask_next_ = OrtValue::CreateTensor(model_.p_device_inputs_->GetAllocator(), attention_mask_shape_, mask_type_);
 
-  bool gpu_update_success = model_.p_device_inputs_->UpdateAttentionMask(attention_mask_next_->GetTensorMutableRawData(),
+  if (!model_.p_device_inputs_->UpdateAttentionMask(attention_mask_next_->GetTensorMutableRawData(),
                                                     attention_mask_->GetTensorMutableRawData(),
                                                     static_cast<int>(batch_size),
                                                     new_kv_length,
                                                     current_length,
                                                     params_->search.max_length,
                                                     false,
-                                                    mask_type_);
-
-  // For TRT-RTX EP, GPU update must always succeed - no CPU fallback needed
-  if (is_trt_rtx) {
-    assert(gpu_update_success && "TRT-RTX EP: GPU UpdateAttentionMask must succeed, CPU fallback not expected");
-    (void)gpu_update_success;  // Suppress unused variable warning in release builds
-  } else if (!gpu_update_success) {
-    // CPU fallback for non-TRT-RTX EPs (should not happen for CUDA either, but kept for safety)
+                                                    mask_type_)) {
     auto attention_mask_next_span = ByteWrapTensor(*model_.p_device_inputs_, *attention_mask_next_);
     auto attention_mask_span = ByteWrapTensor(*model_.p_device_inputs_, *attention_mask_);
     GetDeviceInterface(DeviceType::CPU)->UpdateAttentionMask(attention_mask_next_span.CopyDeviceToCpu().data(),
@@ -398,6 +329,41 @@ void WhisperDecoderState::UpdateInputsOutputs(DeviceSpan<int32_t>& next_tokens, 
   kv_cache_->Update(beam_indices, current_length);
   logits_.Update(next_tokens, first_run_ ? current_length : new_length);
 
+  // Update position_ids if model expects it
+  if (has_position_ids_input_) {
+    const auto& pos_name = model_.config_->model.decoder.inputs.position_ids;
+    if (position_ids_index_ == ~0U) {
+      position_ids_type_ = model_.session_info_.GetInputDataType(pos_name);
+      if (position_ids_type_ != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32 &&
+          position_ids_type_ != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
+        throw std::runtime_error("position_ids must be int32 or int64 type");
+      }
+      position_ids_shape_ = {params_->BatchBeamSize(), static_cast<int64_t>(new_length)};
+      position_ids_ = OrtValue::CreateTensor(model_.p_device_inputs_->GetAllocator(), position_ids_shape_, position_ids_type_);
+      position_ids_index_ = inputs_.size();
+      input_names_.push_back(pos_name.c_str());
+      inputs_.push_back(position_ids_.get());
+    } else if (position_ids_shape_[1] != static_cast<int64_t>(new_length)) {
+      position_ids_shape_[1] = static_cast<int64_t>(new_length);
+      position_ids_ = OrtValue::CreateTensor(model_.p_device_inputs_->GetAllocator(), position_ids_shape_, position_ids_type_);
+      inputs_[position_ids_index_] = position_ids_.get();
+    }
+
+    if (!model_.p_device_inputs_->UpdatePositionIds(position_ids_->GetTensorMutableRawData(),
+                                                    static_cast<int>(position_ids_shape_[0]),
+                                                    current_length,
+                                                    static_cast<int>(new_length),
+                                                    position_ids_type_)) {
+      auto position_ids_span = ByteWrapTensor(*model_.p_device_inputs_, *position_ids_);
+      GetDeviceInterface(DeviceType::CPU)->UpdatePositionIds(position_ids_span.CopyDeviceToCpu().data(),
+                                                            static_cast<int>(position_ids_shape_[0]),
+                                                            current_length,
+                                                            static_cast<int>(new_length),
+                                                            position_ids_type_);
+      position_ids_span.CopyCpuToDevice();
+    }
+  }
+
   // Return early if this method is just initializing the above OrtValue objects and not updating them
   if (first_run_) {
     return;
@@ -448,6 +414,7 @@ void WhisperDecoderState::UpdateInputsOutputs(DeviceSpan<int32_t>& next_tokens, 
       outputs_[output_cross_qk_index_ + i] = output_cross_qk_[i].get();
     }
   }
+
 }
 
 WhisperState::WhisperState(const WhisperModel& model, const GeneratorParams& params, DeviceSpan<int32_t> sequence_lengths_unk)

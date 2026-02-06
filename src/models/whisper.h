@@ -93,6 +93,13 @@ struct WhisperDecoderState : State {
   ONNXTensorElementDataType mask_type_{};                   // INT32 or INT64
   std::array<int64_t, 2> attention_mask_shape_{0, 0};      // [batch_size, seq_len] or [batch_size, max_length] for static
 
+  // Position IDs input (optional, for Whisper position embedding)
+  std::unique_ptr<OrtValue> position_ids_;                  // [batch_size, seq_len]
+  bool has_position_ids_input_{false};                      // Model has position_ids input
+  ONNXTensorElementDataType position_ids_type_{};           // INT32 or INT64
+  std::array<int64_t, 2> position_ids_shape_{0, 0};         // [batch_size, seq_len]
+  size_t position_ids_index_{~0U};
+
   Logits logits_{*this};                                    // Model output
   std::vector<std::unique_ptr<OrtValue>> output_cross_qk_;  // Model output { batch_size, num_heads, sequence_length, num_frames / 2 }
 
