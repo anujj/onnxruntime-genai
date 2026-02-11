@@ -52,7 +52,6 @@ struct Config {
     static constexpr std::string_view PastSequenceLengthName = "past_sequence_length";
     static constexpr std::string_view CurrentSequenceLengthName = "current_sequence_length";
     static constexpr std::string_view TotalSequenceLengthName = "total_sequence_length";
-    static constexpr std::string_view SeqlensKName = "seqlens_k";
     static constexpr std::string_view CacheIndirectionName = "cache_indirection";
     static constexpr std::string_view AlignmentHeadsName = "alignment_heads";
     static constexpr std::string_view TokenTypeIdsName = "token_type_ids";
@@ -249,7 +248,6 @@ struct Config {
         std::string past_sequence_length{Defaults::PastSequenceLengthName};
         std::string current_sequence_length{Defaults::CurrentSequenceLengthName};
         std::string total_sequence_length{Defaults::TotalSequenceLengthName};
-        std::string seqlens_k{Defaults::SeqlensKName};
         std::string cache_indirection{Defaults::CacheIndirectionName};
         std::string encoder_hidden_states{Defaults::EncoderHiddenStatesName};
         std::string rnn_prev_states{Defaults::RnnStatesPrevName};
