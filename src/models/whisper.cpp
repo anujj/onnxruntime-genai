@@ -1,5 +1,6 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
+#include <cassert>
 #include "../generators.h"
 #include "whisper.h"
 namespace Generators {
@@ -86,109 +87,38 @@ WhisperDecoderState::WhisperDecoderState(const WhisperModel& model, const Genera
   // attention_mask is only supported for NvTensorRtRtx EP
   const bool is_trt_rtx = model_.p_device_inputs_->GetType() == DeviceType::NvTensorRtRtx;
   has_attention_mask_input_ = is_trt_rtx && HasAttentionMaskInput();
-  // Note: attention_mask will be initialized lazily on first run when current_length is known
-
-  // position_ids input (optional)
-  has_position_ids_input_ = model_.session_info_.HasInput(model_.config_->model.decoder.inputs.position_ids);
+  has_position_ids_input_ = is_trt_rtx && model_.session_info_.HasInput(model_.config_->model.decoder.inputs.position_ids);
+  // Note: attention_mask/position_ids are initialized lazily on first run when current_length is known
 
   output_cross_qk_name_ = ComposeKeyValueName(model_.config_->model.decoder.outputs.output_cross_qk_names, 0);
 }
 
-template <typename T>
 void WhisperDecoderState::CreateAndInitializeAttentionMask(int64_t valid_length) {
   int64_t batch_size = attention_mask_shape_[0];
   int64_t buffer_length = attention_mask_shape_[1];  // max_length for static, current length for dynamic
 
-  // Check if we're on GPU - if so, we need to create on CPU first, then copy
-  bool is_gpu = (model_.p_device_inputs_->GetType() != DeviceType::CPU);
-
-  if (is_gpu) {
-    // GPU path: Create on CPU, initialize, then copy to GPU
-    auto& cpu_allocator = GetDeviceInterface(DeviceType::CPU)->GetAllocator();
-    auto cpu_tensor = OrtValue::CreateTensor(cpu_allocator, attention_mask_shape_, mask_type_);
-
-    auto* mask_data = cpu_tensor->GetTensorMutableData<T>();
-
-    // Initialize mask values on CPU
-    if (use_static_buffer_) {
-      // For static buffer: valid tokens followed by padding
-      for (int64_t batch = 0; batch < batch_size; ++batch) {
-        for (int64_t i = 0; i < buffer_length; ++i) {
-          mask_data[batch * buffer_length + i] = (i < valid_length) ? static_cast<T>(1) : static_cast<T>(0);
-        }
-      }
-    } else {
-      // For dynamic mode: all tokens are valid (no pre-allocated padding)
-      int64_t total_elements = batch_size * buffer_length;
-      for (int64_t i = 0; i < total_elements; ++i) {
-        mask_data[i] = static_cast<T>(1);
-      }
-    }
-
-    // Create GPU tensor
-    auto& gpu_allocator = model_.p_device_inputs_->GetAllocator();
-    attention_mask_ = OrtValue::CreateTensor(gpu_allocator, attention_mask_shape_, mask_type_);
-
-    // Copy CPU to GPU
-    auto cpu_span = ByteWrapTensor(*GetDeviceInterface(DeviceType::CPU), *cpu_tensor);
-    auto gpu_span = ByteWrapTensor(*model_.p_device_inputs_, *attention_mask_);
-    gpu_span.CopyFrom(cpu_span);
-  } else {
-    // CPU path: Create and initialize directly
-    auto& allocator = model_.p_device_inputs_->GetAllocator();
-    attention_mask_ = OrtValue::CreateTensor(allocator, attention_mask_shape_, mask_type_);
-
-    auto* mask_data = attention_mask_->GetTensorMutableData<T>();
-
-    // Initialize mask values
-    if (use_static_buffer_) {
-      for (int64_t batch = 0; batch < batch_size; ++batch) {
-        for (int64_t i = 0; i < buffer_length; ++i) {
-          mask_data[batch * buffer_length + i] = (i < valid_length) ? static_cast<T>(1) : static_cast<T>(0);
-        }
-      }
-    } else {
-      int64_t total_elements = batch_size * buffer_length;
-      for (int64_t i = 0; i < total_elements; ++i) {
-        mask_data[i] = static_cast<T>(1);
-      }
-    }
+  if (model_.p_device_inputs_->GetType() != DeviceType::NvTensorRtRtx) {
+    assert(false && "Whisper attention_mask handling is only supported for TRT-RTX EP.");
+    throw std::runtime_error("Whisper attention_mask handling requires TRT-RTX EP.");
   }
-}
 
-template <typename T>
-void WhisperDecoderState::UpdateAttentionMaskStaticImpl(
-    T* mask_data,
-    int64_t batch_size,
-    int64_t current_length,
-    int64_t max_length) {
-  // Static buffer mode: Update in-place by setting position current_length-1 to 1
-  // Example: if current_length=5, set mask[4] = 1 (0-indexed)
-  // Buffer is pre-allocated: [1,1,1,1,0,0,...,0] -> [1,1,1,1,1,0,...,0]
-  for (int64_t batch = 0; batch < batch_size; ++batch) {
-    if (current_length - 1 < max_length) {
-      mask_data[batch * max_length + (current_length - 1)] = 1;
-    }
-  }
-}
+  auto& gpu_allocator = model_.p_device_inputs_->GetAllocator();
+  attention_mask_ = OrtValue::CreateTensor(gpu_allocator, attention_mask_shape_, mask_type_);
+  auto attention_mask_span = ByteWrapTensor(*model_.p_device_inputs_, *attention_mask_);
+  attention_mask_span.Zero();
 
-template <typename T>
-void WhisperDecoderState::UpdateAttentionMaskDynamicImpl(
-    T* next_mask_data,
-    const T* current_mask_data,
-    int64_t batch_size,
-    int64_t old_seq_length,
-    int64_t new_seq_length) {
-  // Dynamic mode: Copy old mask + append 1s for new tokens
-  for (int64_t i = 0; i < batch_size; ++i) {
-    // Copy existing mask values
-    for (int64_t j = 0; j < old_seq_length; ++j) {
-      next_mask_data[i * new_seq_length + j] =
-        current_mask_data[i * old_seq_length + j];
-    }
-    // Append 1s for new tokens
-    for (int64_t j = old_seq_length; j < new_seq_length; ++j) {
-      next_mask_data[i * new_seq_length + j] = 1;
+  if (valid_length > 0) {
+    const bool updated_on_device = model_.p_device_inputs_->UpdateAttentionMask(nullptr,
+                                                                                 attention_mask_->GetTensorMutableRawData(),
+                                                                                 static_cast<int>(batch_size),
+                                                                                 static_cast<int>(valid_length),
+                                                                                 static_cast<int>(valid_length),
+                                                                                 static_cast<int>(buffer_length),
+                                                                                 true,
+                                                                                 mask_type_);
+    if (!updated_on_device) {
+      assert(false && "TRT-RTX attention_mask initialization must remain on GPU.");
+      throw std::runtime_error("TRT-RTX attention_mask initialization unexpectedly attempted CPU fallback.");
     }
   }
 }
@@ -199,24 +129,17 @@ void WhisperDecoderState::UpdateAttentionMask(int current_length, int new_kv_len
   if (use_static_buffer_) {
     // Static buffer mode: update in-place
     int64_t max_length = attention_mask_shape_[1];
-    if (!model_.p_device_inputs_->UpdateAttentionMask(nullptr,
-                                                      attention_mask_->GetTensorMutableRawData(),
-                                                      static_cast<int>(batch_size),
-                                                      new_kv_length,
-                                                      current_length,
-                                                      static_cast<int>(max_length),
-                                                      true,
-                                                      mask_type_)) {
-      auto attention_mask_span = ByteWrapTensor(*model_.p_device_inputs_, *attention_mask_);
-      GetDeviceInterface(DeviceType::CPU)->UpdateAttentionMask(nullptr,
-                                                               attention_mask_span.CopyDeviceToCpu().data(),
-                                                               static_cast<int>(batch_size),
-                                                               new_kv_length,
-                                                               current_length,
-                                                               static_cast<int>(max_length),
-                                                               true,
-                                                               mask_type_);
-      attention_mask_span.CopyCpuToDevice();
+    const bool updated_on_device = model_.p_device_inputs_->UpdateAttentionMask(nullptr,
+                                                                                 attention_mask_->GetTensorMutableRawData(),
+                                                                                 static_cast<int>(batch_size),
+                                                                                 new_kv_length,
+                                                                                 current_length,
+                                                                                 static_cast<int>(max_length),
+                                                                                 true,
+                                                                                 mask_type_);
+    if (!updated_on_device) {
+      assert(false && "TRT-RTX static attention_mask updates must remain on GPU.");
+      throw std::runtime_error("TRT-RTX static attention_mask update unexpectedly attempted CPU fallback.");
     }
     return;
   }
@@ -225,26 +148,17 @@ void WhisperDecoderState::UpdateAttentionMask(int current_length, int new_kv_len
   attention_mask_shape_[1] = current_length;
   attention_mask_next_ = OrtValue::CreateTensor(model_.p_device_inputs_->GetAllocator(), attention_mask_shape_, mask_type_);
 
-  if (!model_.p_device_inputs_->UpdateAttentionMask(attention_mask_next_->GetTensorMutableRawData(),
-                                                    attention_mask_->GetTensorMutableRawData(),
-                                                    static_cast<int>(batch_size),
-                                                    new_kv_length,
-                                                    current_length,
-                                                    params_->search.max_length,
-                                                    false,
-                                                    mask_type_)) {
-    auto attention_mask_next_span = ByteWrapTensor(*model_.p_device_inputs_, *attention_mask_next_);
-    auto attention_mask_span = ByteWrapTensor(*model_.p_device_inputs_, *attention_mask_);
-    GetDeviceInterface(DeviceType::CPU)->UpdateAttentionMask(attention_mask_next_span.CopyDeviceToCpu().data(),
-                                                             attention_mask_span.CopyDeviceToCpu().data(),
-                                                             static_cast<int>(batch_size),
-                                                             new_kv_length,
-                                                             current_length,
-                                                             params_->search.max_length,
-                                                             false,
-                                                             mask_type_);
-    attention_mask_next_span.CopyCpuToDevice();
-    attention_mask_span.CopyCpuToDevice();
+  const bool updated_on_device = model_.p_device_inputs_->UpdateAttentionMask(attention_mask_next_->GetTensorMutableRawData(),
+                                                                               attention_mask_->GetTensorMutableRawData(),
+                                                                               static_cast<int>(batch_size),
+                                                                               new_kv_length,
+                                                                               current_length,
+                                                                               params_->search.max_length,
+                                                                               false,
+                                                                               mask_type_);
+  if (!updated_on_device) {
+    assert(false && "TRT-RTX attention_mask updates must remain on GPU.");
+    throw std::runtime_error("TRT-RTX attention_mask update unexpectedly attempted CPU fallback.");
   }
 
   // Swap: next becomes current
@@ -284,11 +198,7 @@ DeviceSpan<float> WhisperDecoderState::Run(int current_length, DeviceSpan<int32_
     }
 
     // Create initial attention mask tensor
-    if (mask_type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32) {
-      CreateAndInitializeAttentionMask<int32_t>(current_length);
-    } else {
-      CreateAndInitializeAttentionMask<int64_t>(current_length);
-    }
+    CreateAndInitializeAttentionMask(current_length);
 
     // Register as input
     input_names_.push_back(model_.config_->model.decoder.inputs.attention_mask.c_str());
@@ -322,10 +232,9 @@ DeviceSpan<float> WhisperDecoderState::Run(int current_length, DeviceSpan<int32_
 }
 
 void WhisperDecoderState::UpdateInputsOutputs(DeviceSpan<int32_t>& next_tokens, DeviceSpan<int32_t> beam_indices, int current_length, bool first_update) {
-  int batch_size = static_cast<int>(input_ids_.GetShape()[0]);
-  size_t new_length = next_tokens.size() / batch_size;
-
   input_ids_.Update(next_tokens);
+  const auto input_ids_shape = input_ids_.GetShape();
+  size_t new_length = static_cast<size_t>(input_ids_shape[1]);
   kv_cache_->Update(beam_indices, current_length);
   logits_.Update(next_tokens, first_run_ ? current_length : new_length);
 
@@ -349,18 +258,36 @@ void WhisperDecoderState::UpdateInputsOutputs(DeviceSpan<int32_t>& next_tokens, 
       inputs_[position_ids_index_] = position_ids_.get();
     }
 
-    if (!model_.p_device_inputs_->UpdatePositionIds(position_ids_->GetTensorMutableRawData(),
-                                                    static_cast<int>(position_ids_shape_[0]),
-                                                    current_length,
-                                                    static_cast<int>(new_length),
-                                                    position_ids_type_)) {
-      auto position_ids_span = ByteWrapTensor(*model_.p_device_inputs_, *position_ids_);
-      GetDeviceInterface(DeviceType::CPU)->UpdatePositionIds(position_ids_span.CopyDeviceToCpu().data(),
-                                                            static_cast<int>(position_ids_shape_[0]),
-                                                            current_length,
-                                                            static_cast<int>(new_length),
-                                                            position_ids_type_);
-      position_ids_span.CopyCpuToDevice();
+    const int pos_batch = static_cast<int>(position_ids_shape_[0]);
+    const int pos_seq = static_cast<int>(new_length);
+    if (pos_batch > 1) {
+      // For batch-beam > 1, initialize/update each row via the batch=1 kernel path.
+      // This avoids the generic multi-batch increment path, which is not valid for
+      // prefill matrix initialization in Whisper beam search.
+      auto* base = static_cast<uint8_t*>(position_ids_->GetTensorMutableRawData());
+      const size_t row_bytes = static_cast<size_t>(pos_seq) * Ort::SizeOf(position_ids_type_);
+      for (int row = 0; row < pos_batch; ++row) {
+        void* row_ptr = base + static_cast<size_t>(row) * row_bytes;
+        const bool updated_on_device = model_.p_device_inputs_->UpdatePositionIds(row_ptr,
+                                                                                   1,
+                                                                                   current_length,
+                                                                                   pos_seq,
+                                                                                   position_ids_type_);
+        if (!updated_on_device) {
+          assert(false && "TRT-RTX position_ids row updates must remain on GPU.");
+          throw std::runtime_error("TRT-RTX position_ids row update unexpectedly attempted CPU fallback.");
+        }
+      }
+    } else {
+      const bool updated_on_device = model_.p_device_inputs_->UpdatePositionIds(position_ids_->GetTensorMutableRawData(),
+                                                                                 pos_batch,
+                                                                                 current_length,
+                                                                                 pos_seq,
+                                                                                 position_ids_type_);
+      if (!updated_on_device) {
+        assert(false && "TRT-RTX position_ids updates must remain on GPU.");
+        throw std::runtime_error("TRT-RTX position_ids update unexpectedly attempted CPU fallback.");
+      }
     }
   }
 
@@ -676,13 +603,5 @@ OrtValue* WhisperState::GetOutput(const char* name) {
 
   return State::GetOutput(name);
 };
-
-// Explicit template instantiations
-template void WhisperDecoderState::CreateAndInitializeAttentionMask<int32_t>(int64_t valid_length);
-template void WhisperDecoderState::CreateAndInitializeAttentionMask<int64_t>(int64_t valid_length);
-template void WhisperDecoderState::UpdateAttentionMaskStaticImpl<int32_t>(int32_t* mask_data, int64_t batch_size, int64_t current_length, int64_t max_length);
-template void WhisperDecoderState::UpdateAttentionMaskStaticImpl<int64_t>(int64_t* mask_data, int64_t batch_size, int64_t current_length, int64_t max_length);
-template void WhisperDecoderState::UpdateAttentionMaskDynamicImpl<int32_t>(int32_t* next_mask_data, const int32_t* current_mask_data, int64_t batch_size, int64_t old_seq_length, int64_t new_seq_length);
-template void WhisperDecoderState::UpdateAttentionMaskDynamicImpl<int64_t>(int64_t* next_mask_data, const int64_t* current_mask_data, int64_t batch_size, int64_t old_seq_length, int64_t new_seq_length);
 
 }  // namespace Generators

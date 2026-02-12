@@ -65,14 +65,7 @@ struct WhisperDecoderState : State {
   void UpdateInputsOutputs(DeviceSpan<int32_t>& next_tokens, DeviceSpan<int32_t> next_indices, int current_length, bool first_update);
 
   // Attention mask helper functions
-  template <typename T>
   void CreateAndInitializeAttentionMask(int64_t valid_length);
-
-  template <typename T>
-  void UpdateAttentionMaskStaticImpl(T* mask_data, int64_t batch_size, int64_t current_length, int64_t max_length);
-
-  template <typename T>
-  void UpdateAttentionMaskDynamicImpl(T* next_mask_data, const T* current_mask_data, int64_t batch_size, int64_t old_seq_length, int64_t new_seq_length);
 
   void UpdateAttentionMask(int current_length, int new_kv_length);
 
@@ -88,14 +81,14 @@ struct WhisperDecoderState : State {
   // Attention mask support (TensorRT-RTX pattern) for GQA in-place KV cache
   std::unique_ptr<OrtValue> attention_mask_;                // Current mask [batch_size, seq_len or max_length]
   std::unique_ptr<OrtValue> attention_mask_next_;           // Next mask (for updates, only used for dynamic mode)
-  bool has_attention_mask_input_{false};                    // Model has attention_mask input
+  bool has_attention_mask_input_{false};                    // TRT-RTX decoder has attention_mask input
   bool use_static_buffer_{false};                           // True if using in-place KV cache (pre-allocated buffer)
   ONNXTensorElementDataType mask_type_{};                   // INT32 or INT64
   std::array<int64_t, 2> attention_mask_shape_{0, 0};      // [batch_size, seq_len] or [batch_size, max_length] for static
 
   // Position IDs input (optional, for Whisper position embedding)
   std::unique_ptr<OrtValue> position_ids_;                  // [batch_size, seq_len]
-  bool has_position_ids_input_{false};                      // Model has position_ids input
+  bool has_position_ids_input_{false};                      // TRT-RTX decoder has position_ids input
   ONNXTensorElementDataType position_ids_type_{};           // INT32 or INT64
   std::array<int64_t, 2> position_ids_shape_{0, 0};         // [batch_size, seq_len]
   size_t position_ids_index_{~0U};
