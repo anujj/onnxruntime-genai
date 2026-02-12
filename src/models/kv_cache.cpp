@@ -245,8 +245,7 @@ void DefaultKeyValueCache::Add() {
     state_.output_names_.push_back(output_name_strings_[i].c_str());
   }
 
-  // For shared_past_present, the past & presents never change, so set the inputs
-  // to the present values (outputs are already set above)
+  // For shared_past_present, the past & presents never change, so set the inputs to the present values (outputs are already set above)
   if (past_present_share_buffer_) {
     for (int i = 0; i < layer_count_ * 2; ++i) {
       state_.inputs_[input_index_ + i] = presents_[i].get();
