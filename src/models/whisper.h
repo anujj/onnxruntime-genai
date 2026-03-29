@@ -55,11 +55,19 @@ struct WhisperDecoderState : State {
   bool HasCacheIndirectionInput() { return model_.session_info_.HasInput(model_.config_->model.decoder.inputs.cache_indirection); }
   bool UsesDecoderMaskedMHA() { return HasPastSequenceLengthInput() && HasCacheIndirectionInput(); }
 
+  // GQA in-place KV cache support with attention_mask
+  bool HasAttentionMaskInput() const { return model_.session_info_.HasInput(model_.config_->model.decoder.inputs.attention_mask); }
+
  private:
   // clang-format off
   friend struct WhisperState;
 
   void UpdateInputsOutputs(DeviceSpan<int32_t>& next_tokens, DeviceSpan<int32_t> next_indices, int current_length, bool first_update);
+
+  // Attention mask helper functions
+  void CreateAndInitializeAttentionMask(int64_t valid_length);
+
+  void UpdateAttentionMask(int current_length, int new_kv_length);
 
   const WhisperModel& model_;
 
@@ -69,6 +77,21 @@ struct WhisperDecoderState : State {
   // Inputs for beam search attention
   std::unique_ptr<OrtValue> past_sequence_length_;          // Model input
   std::unique_ptr<OrtValue> cache_indirection_;             // Model input { batch_size, num_beams, max_sequence_length }
+
+  // Attention mask support (TensorRT-RTX pattern) for GQA in-place KV cache
+  std::unique_ptr<OrtValue> attention_mask_;                // Current mask [batch_size, seq_len or max_length]
+  std::unique_ptr<OrtValue> attention_mask_next_;           // Next mask (for updates, only used for dynamic mode)
+  bool has_attention_mask_input_{false};                    // TRT-RTX decoder has attention_mask input
+  bool use_static_buffer_{false};                           // True if using in-place KV cache (pre-allocated buffer)
+  ONNXTensorElementDataType mask_type_{};                   // INT32 or INT64
+  std::array<int64_t, 2> attention_mask_shape_{0, 0};      // [batch_size, seq_len] or [batch_size, max_length] for static
+
+  // Position IDs input (optional, for Whisper position embedding)
+  std::unique_ptr<OrtValue> position_ids_;                  // [batch_size, seq_len]
+  bool has_position_ids_input_{false};                      // TRT-RTX decoder has position_ids input
+  ONNXTensorElementDataType position_ids_type_{};           // INT32 or INT64
+  std::array<int64_t, 2> position_ids_shape_{0, 0};         // [batch_size, seq_len]
+  size_t position_ids_index_{~0U};
 
   Logits logits_{*this};                                    // Model output
   std::vector<std::unique_ptr<OrtValue>> output_cross_qk_;  // Model output { batch_size, num_heads, sequence_length, num_frames / 2 }
